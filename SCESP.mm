@@ -27,9 +27,13 @@
 static const char *kGameImage = "Chillow.StandChillow.Client.dll";
 struct Target { const char *ns; const char *name; };
 static const Target kTargets[] = {
+    {"Chillow.StandChillow.Player", "PlayerController"},   // every character, local + bots
+    {"Chillow.StandChillow.Player", "CharacterPlayer"},
     {"Chillow.StandChillow.Bots.Core", "BotPlayerController"},
-    {"Chillow.StandChillow.Dummy",     "DummyController"},
+    {"Chillow.StandChillow.Dummy", "DummyController"},
 };
+static const int kN = sizeof(kTargets) / sizeof(kTargets[0]);
+static const float kSelfRadius = 0.7f;   // skip anything this close to the camera (your own body)
 static const float kHeadHeight = 1.8f;   // metres above transform.position (assumes feet pivot)
 static const int   kRefreshFrames = 20;  // re-scan for objects every N frames
 
@@ -102,11 +106,14 @@ static void *findImage(const char *name) {
 // ---- resolved handles ------------------------------------------------------------------
 static void *m_findObjects, *m_cam_main, *m_w2s, *m_get_transform, *m_get_position;
 static void *m_screen_w, *m_screen_h;
-static void *k_targets[2];
+static void *k_targets[8];
+static size_t g_counts[8];
 static bool g_findTakesBool = false;
 static bool g_ready = false;
 static bool g_espOn = true;
 static bool g_apiOk = false;
+
+static bool anyTarget() { for (int i = 0; i < kN; i++) if (k_targets[i]) return true; return false; }
 
 static bool resolveAll() {
     void *core = findImage("UnityEngine.CoreModule.dll");
@@ -129,11 +136,11 @@ static bool resolveAll() {
     m_screen_w      = il2_get_method(cScreen, "get_width", 0);
     m_screen_h      = il2_get_method(cScreen, "get_height", 0);
 
-    for (int i = 0; i < 2; i++) k_targets[i] = il2_class_from_name(game, kTargets[i].ns, kTargets[i].name);
-    NSLog(@"[SCESP] resolve: find=%p cam=%p w2s=%p tr=%p pos=%p t0=%p t1=%p",
-          m_findObjects, m_cam_main, m_w2s, m_get_transform, m_get_position, k_targets[0], k_targets[1]);
+    for (int i = 0; i < kN; i++) k_targets[i] = il2_class_from_name(game, kTargets[i].ns, kTargets[i].name);
+    NSLog(@"[SCESP] resolve: find=%p cam=%p w2s=%p tr=%p pos=%p", m_findObjects, m_cam_main, m_w2s, m_get_transform, m_get_position);
+    for (int i = 0; i < kN; i++) NSLog(@"[SCESP] target %s = %p", kTargets[i].name, k_targets[i]);
     return m_findObjects && m_cam_main && m_w2s && m_get_transform && m_get_position &&
-           m_screen_w && m_screen_h && (k_targets[0] || k_targets[1]);
+           m_screen_w && m_screen_h && anyTarget();
 }
 
 // ---- helpers ---------------------------------------------------------------------------
@@ -156,7 +163,8 @@ static std::vector<uint32_t> g_handles;
 static void refreshObjects() {
     for (uint32_t h : g_handles) il2_gc_free(h);
     g_handles.clear();
-    for (int t = 0; t < 2; t++) {
+    for (int t = 0; t < kN; t++) {
+        g_counts[t] = 0;
         if (!k_targets[t]) continue;
         void *typeObj = il2_type_object(il2_class_type(k_targets[t]));
         void *exc = nullptr;
@@ -174,7 +182,7 @@ static void refreshObjects() {
         void **elems = (void **)((char *)arr + 32);         // first element
         if (len > 256) len = 256;
         for (uintptr_t i = 0; i < len; i++)
-            if (elems[i]) g_handles.push_back(il2_gc_new(elems[i], 0));
+            if (elems[i]) { g_handles.push_back(il2_gc_new(elems[i], 0)); g_counts[t]++; }
     }
 }
 
@@ -206,10 +214,11 @@ static void refreshObjects() {
         if (win) {
     if (!_btn) {
         _btn = [UIButton buttonWithType:UIButtonTypeCustom];
-        _btn.frame = CGRectMake(8, 44, 190, 26);
+        _btn.frame = CGRectMake(8, 44, 230, 26);
         _btn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
         _btn.layer.cornerRadius = 6;
-        _btn.titleLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
+        _btn.titleLabel.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightMedium];
+        _btn.titleLabel.lineBreakMode = NSLineBreakByClipping;
         [_btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
         [_btn addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     }
@@ -251,6 +260,12 @@ static void refreshObjects() {
     void *cam = il2_invoke(m_cam_main, nullptr, nullptr, &exc);
     int sw = getInt(m_screen_w), sh = getInt(m_screen_h);
     bool camOk = cam && !exc;
+    V3 camPos = {0, 0, 0}; bool haveCam = false;
+    if (camOk) {
+        void *ce = nullptr;
+        void *ctr = il2_invoke(m_get_transform, cam, nullptr, &ce);
+        if (!ce && ctr) haveCam = getVec3(m_get_position, ctr, nullptr, &camPos);
+    }
     if (g_espOn && camOk && sw > 0 && sh > 0) {
         CGSize vs = _overlay.bounds.size;
         for (uint32_t h : g_handles) {
@@ -261,6 +276,10 @@ static void refreshObjects() {
             if (e1 || !tr) continue;
             V3 pos;
             if (!getVec3(m_get_position, tr, nullptr, &pos)) continue;
+            if (haveCam) {
+                float dx = pos.x - camPos.x, dz = pos.z - camPos.z;
+                if (dx * dx + dz * dz < kSelfRadius * kSelfRadius) continue;   // that's you
+            }
             V3 head = { pos.x, pos.y + kHeadHeight, pos.z }, foot = pos, sh_, sf;
             void *a1[1] = { &head }, *a2[1] = { &foot };
             if (!getVec3(m_w2s, cam, a1, &sh_) || !getVec3(m_w2s, cam, a2, &sf)) continue;
@@ -286,8 +305,10 @@ static void refreshObjects() {
 
 - (void)updateButton:(size_t)n cam:(BOOL)cam {
     if (!_btn) return;
-    NSString *t = [NSString stringWithFormat:@"ESP %@ | %@ | obj %zu | cam %@",
-                   g_espOn ? @"ON" : @"OFF", _stage ?: @"-", n, cam ? @"ok" : @"-"];
+    NSMutableString *cs = [NSMutableString string];
+    for (int i = 0; i < kN; i++) [cs appendFormat:@"%s%zu", i ? "/" : "", g_counts[i]];
+    NSString *t = [NSString stringWithFormat:@"ESP %@ | %@ | %@ | cam %@",
+                   g_espOn ? @"ON" : @"OFF", _stage ?: @"-", cs, cam ? @"ok" : @"-"];
     [_btn setTitle:t forState:UIControlStateNormal];
 }
 @end
