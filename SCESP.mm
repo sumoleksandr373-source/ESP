@@ -127,8 +127,10 @@ static bool resolveAll() {
     void *cScreen = il2_class_from_name(core, "UnityEngine", "Screen");
     if (!cObject || !cCamera || !cComp || !cTrans || !cScreen) return false;
 
-    m_findObjects = il2_get_method(cObject, "FindObjectsOfType", 1);
-    if (!m_findObjects) { m_findObjects = il2_get_method(cObject, "FindObjectsOfType", 2); g_findTakesBool = m_findObjects != nullptr; }
+    // The 1-arg FindObjectsOfType(Type) is stripped from this build (null body), so use the
+    // 2-arg (Type, bool includeInactive) overload, which is present.
+    m_findObjects = il2_get_method(cObject, "FindObjectsOfType", 2);
+    g_findTakesBool = m_findObjects != nullptr;
     m_cam_main      = il2_get_method(cCamera, "get_main", 0);
     m_w2s           = il2_get_method(cCamera, "WorldToScreenPoint", 1);
     m_get_transform = il2_get_method(cComp, "get_transform", 0);
