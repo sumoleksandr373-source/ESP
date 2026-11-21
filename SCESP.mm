@@ -105,6 +105,8 @@ static void *m_screen_w, *m_screen_h;
 static void *k_targets[2];
 static bool g_findTakesBool = false;
 static bool g_ready = false;
+static bool g_espOn = true;
+static bool g_apiOk = false;
 
 static bool resolveAll() {
     void *core = findImage("UnityEngine.CoreModule.dll");
@@ -179,13 +181,15 @@ static void refreshObjects() {
 // ---- overlay ---------------------------------------------------------------------------
 @interface SCESPDriver : NSObject
 - (void)tick:(CADisplayLink *)link;
+- (void)toggle;
 @end
 
 @implementation SCESPDriver {
     UIView *_overlay;
     CAShapeLayer *_boxes;
+    UIButton *_btn;
+    NSString *_stage;
     int _frame;
-    int _tries;
 }
 
 - (UIWindow *)keyWindow {
@@ -197,10 +201,29 @@ static void refreshObjects() {
 }
 
 - (void)tick:(CADisplayLink *)link {
+    {
+        UIWindow *win = [self keyWindow];
+        if (win) {
+    if (!_btn) {
+        _btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        _btn.frame = CGRectMake(8, 44, 190, 26);
+        _btn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+        _btn.layer.cornerRadius = 6;
+        _btn.titleLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium];
+        [_btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        [_btn addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
+    }
+    if (_btn.superview != win) { [_btn removeFromSuperview]; [win addSubview:_btn]; }
+    [win bringSubviewToFront:_btn];
+        }
+    }
     if (!g_ready) {
         if (_frame++ % 60) return;                 // retry about once per second
-        if (!il2_domain_get && !loadApi()) { if (++_tries > 30) link.paused = YES; return; }
-        if (!resolveAll()) return;                 // game assemblies not loaded yet
+        _stage = @"waiting for il2cpp";
+        if (!g_apiOk) g_apiOk = loadApi();
+        if (!g_apiOk) { _stage = @"il2cpp API missing"; [self updateButton:0 cam:NO]; return; }
+        _stage = @"resolving classes";
+        if (!resolveAll()) { [self updateButton:0 cam:NO]; return; }
         g_ready = true;
         NSLog(@"[SCESP] ready");
         _frame = 0;
@@ -227,7 +250,8 @@ static void refreshObjects() {
     void *exc = nullptr;
     void *cam = il2_invoke(m_cam_main, nullptr, nullptr, &exc);
     int sw = getInt(m_screen_w), sh = getInt(m_screen_h);
-    if (cam && !exc && sw > 0 && sh > 0) {
+    bool camOk = cam && !exc;
+    if (g_espOn && camOk && sw > 0 && sh > 0) {
         CGSize vs = _overlay.bounds.size;
         for (uint32_t h : g_handles) {
             void *obj = il2_gc_get(h);
@@ -254,6 +278,17 @@ static void refreshObjects() {
     _boxes.frame = _overlay.bounds;
     _boxes.path = path.CGPath;
     [CATransaction commit];
+    _stage = @"ready";
+    [self updateButton:g_handles.size() cam:camOk];
+}
+
+- (void)toggle { g_espOn = !g_espOn; }
+
+- (void)updateButton:(size_t)n cam:(BOOL)cam {
+    if (!_btn) return;
+    NSString *t = [NSString stringWithFormat:@"ESP %@ | %@ | obj %zu | cam %@",
+                   g_espOn ? @"ON" : @"OFF", _stage ?: @"-", n, cam ? @"ok" : @"-"];
+    [_btn setTitle:t forState:UIControlStateNormal];
 }
 @end
 
