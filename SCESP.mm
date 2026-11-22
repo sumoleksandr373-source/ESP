@@ -52,6 +52,7 @@ struct Settings {
     int color = 0;
     float lw = 1.5f;
     float head = 1.8f;
+    float fov = 45.0f;      // aim capture cone, degrees
 };
 static Settings g_set;
 static bool g_dirty = true;
@@ -78,6 +79,7 @@ static void saveSettings() {
     [d setBool:g_set.hdot forKey:@"scesp_hdot"];
     [d setInteger:g_set.color forKey:@"scesp_color"];
     [d setFloat:g_set.lw forKey:@"scesp_lw"];      [d setFloat:g_set.head forKey:@"scesp_head"];
+    [d setFloat:g_set.fov forKey:@"scesp_fov"];
 }
 static void loadSettings() {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -93,6 +95,7 @@ static void loadSettings() {
     g_set.lw = [d floatForKey:@"scesp_lw"];        g_set.head = [d floatForKey:@"scesp_head"];
     if (g_set.lw < 0.5f) g_set.lw = 1.5f;
     if (g_set.head < 1.0f) g_set.head = 1.8f;
+    g_set.fov = [d floatForKey:@"scesp_fov"]; if (g_set.fov < 5.0f) g_set.fov = 45.0f;
 }
 
 // ---- il2cpp API ------------------------------------------------------------------------
@@ -474,6 +477,17 @@ static void loadAim() {
 }
 // Correlation is taken over ~6-tick windows (about 0.1 s): the game applies its look input a frame
 // before / after the camera transform moves, so per-tick deltas of the right field do not line up.
+// Probe: a field that correlates 1.00 with the camera can still be a mirror the game rewrites every
+// frame. Each strong candidate is nudged by a known amount; only the one that really turns the view wins.
+struct PC { Cand c; float k; double r; };
+static std::vector<PC> g_probeY, g_probeP;
+static int g_probeAxis = -1;            // -1 idle, 0 testing yaw list, 1 testing pitch list
+static size_t g_probeIdx = 0;
+static int g_probePhase = 0;
+static double g_probeT0 = 0, g_probeBegin = 0;
+static float g_probeStart = 0, g_probeOrig = 0, g_probeLastY = 0, g_probeLastP = 0;
+static bool g_probeHaveLast = false, g_probeOkY = false, g_probeOkP = false;
+static NSMutableString *g_report = nil;
 static float g_wdy = 0, g_wdp = 0, g_totY = 0, g_totP = 0;
 static int g_wn = 0;
 static NSString *candName(const Cand &c) {
@@ -533,6 +547,21 @@ static void learnFinish() {
     if (okY) { g_yawC = g_cands[by]; g_yawK = (float)ky; g_haveYaw = true; }
     if (okP) { g_pitC = g_cands[bp]; g_pitK = (float)kp; g_havePit = true; }
     if (okY || okP) saveAim();
+    g_probeY.clear(); g_probeP.clear();
+    for (size_t i = 0; i < g_cands.size(); i++) {
+        Stat &st = g_stats[i];
+        if (st.n < 8 || st.sv2 < 1e-12) continue;
+        const R &r = rs[i];
+        if (st.sy2 > 20 && fabs(r.sy) > 0.005 && fabs(r.sy) < 50 && fabs(r.ry) >= 0.95) g_probeY.push_back({ g_cands[i], (float)r.sy, fabs(r.ry) });
+        if (st.sp2 > 20 && fabs(r.sp) > 0.005 && fabs(r.sp) < 50 && fabs(r.rp) >= 0.95) g_probeP.push_back({ g_cands[i], (float)r.sp, fabs(r.rp) });
+    }
+    auto byR = [](const PC &a, const PC &b) { return a.r > b.r; };
+    std::sort(g_probeY.begin(), g_probeY.end(), byR); std::sort(g_probeP.begin(), g_probeP.end(), byR);
+    if (g_probeY.size() > 24) g_probeY.resize(24);
+    if (g_probeP.size() > 24) g_probeP.resize(24);
+    g_probeAxis = !g_probeY.empty() ? 0 : (!g_probeP.empty() ? 1 : -1);
+    g_probeIdx = 0; g_probePhase = 0; g_probeHaveLast = false; g_probeOkY = g_probeOkP = false;
+    g_probeBegin = CACurrentMediaTime();
 
     // full report -> clipboard + log, so the numbers can be inspected without a console
     NSMutableString *rep = [NSMutableString stringWithFormat:@"cands=%zu used=%zu rot yaw=%.0f pit=%.0f deg\n", g_cands.size(), used, g_totY, g_totP];
@@ -546,11 +575,54 @@ static void learnFinish() {
             [rep appendFormat:@"%.3f k=%.4f %@ off=%d/%d\n", top[t].first, axis ? r.sp : r.sy, candName(c), c.off, c.off2];
         }
     }
+    g_report = rep;
     UIPasteboard.generalPasteboard.string = rep;
     NSLog(@"[SCESP] learn report\n%@", rep);
 
-    g_learnMsg = [NSString stringWithFormat:@"learn: yaw %s %.2f pit %s %.2f rot %.0f/%.0f (copied)", okY ? "OK" : "NO", cy, okP ? "OK" : "NO", cp, g_totY, g_totP];
+    g_learnMsg = [NSString stringWithFormat:@"learn y %s%.2f p %s%.2f rot %.0f/%.0f", okY ? "OK" : "NO", cy, okP ? "OK" : "NO", cp, g_totY, g_totP];
     g_msgUntil = CACurrentMediaTime() + 20;
+}
+static void probeStep(void *me, void *aim, float cy, float cp, double now) {
+    bool still = true;
+    if (g_probeHaveLast) still = fabsf(wrap180(cy - g_probeLastY)) < 0.15f && fabsf(cp - g_probeLastP) < 0.15f;
+    g_probeLastY = cy; g_probeLastP = cp; g_probeHaveLast = true;
+    std::vector<PC> &list = g_probeAxis == 0 ? g_probeY : g_probeP;
+    bool timeout = now - g_probeBegin > 45.0;
+    if (timeout || g_probeIdx >= list.size()) {
+        if (!timeout && g_probeAxis == 0 && !g_probeP.empty()) { g_probeAxis = 1; g_probeIdx = 0; g_probePhase = 0; return; }
+        g_probeAxis = -1; g_probeHaveLast = false;
+        saveAim();
+        g_learnMsg = [NSString stringWithFormat:@"aim probe: yaw %s pit %s%s", g_probeOkY ? "OK" : "NO", g_probeOkP ? "OK" : "NO", timeout ? " (timeout)" : ""];
+        g_msgUntil = now + 20;
+        if (g_report) { [g_report appendFormat:@"== probe: yaw %d pit %d\n", g_probeOkY, g_probeOkP]; UIPasteboard.generalPasteboard.string = g_report; }
+        return;
+    }
+    PC &pc = list[g_probeIdx];
+    g_learnMsg = [NSString stringWithFormat:@"probe %s %zu/%zu - hold still", g_probeAxis ? "pitch" : "yaw", g_probeIdx + 1, list.size()];
+    g_msgUntil = now + 2;
+    float *a = candAddr(pc.c, me, aim);
+    if (!a) { g_probeIdx++; g_probePhase = 0; return; }
+    if (g_probePhase == 0) {
+        if (!still) return;
+        g_probeOrig = *a; g_probeStart = g_probeAxis == 0 ? cy : cp;
+        *a += pc.k * 4.0f;                      // ask the game to turn the view by +4 degrees through this field
+        g_probePhase = 1; g_probeT0 = now;
+        return;
+    }
+    if (now - g_probeT0 < 0.25) return;
+    float d = g_probeAxis == 0 ? wrap180(cy - g_probeStart) : cp - g_probeStart;
+    bool drives = d > 2.0f && d < 6.5f;
+    if (drives) {
+        if (g_probeAxis == 0) { g_yawC = pc.c; g_yawK = pc.k; g_haveYaw = true; g_probeOkY = true; }
+        else                  { g_pitC = pc.c; g_pitK = pc.k; g_havePit = true; g_probeOkP = true; }
+        if (g_report) [g_report appendFormat:@"== DRIVER %s: %@ off=%d/%d k=%.4f moved=%.2f\n", g_probeAxis ? "pitch" : "yaw", candName(pc.c), pc.c.off, pc.c.off2, pc.k, d];
+        g_probeIdx = list.size();               // axis solved
+    } else {
+        if (g_report) [g_report appendFormat:@"   mirror/no effect: %@ (moved %.2f)\n", candName(pc.c), d];
+        *a = g_probeOrig;
+        g_probeIdx++;
+    }
+    g_probePhase = 0;
 }
 static void aimStep(void *me, void *aim, float dyaw, float dpit) {
     float *py = candAddr(g_yawC, me, aim), *pp = candAddr(g_pitC, me, aim);
@@ -698,35 +770,70 @@ static void rescan(bool wantBones) {
 }
 
 // ---- health bar ------------------------------------------------------------------------
-// Candidates = every int / float instance field of the player class (and of Chillow.* reference fields
-// one level deep). Learn: snapshot all characters, user damages one bot, compare. The right field
-// dropped on exactly one character and did not move on any other.
-struct HCand { uint8_t deref, isInt; int off, off2; };
+// The game uses Anti-Cheat Toolkit, so health is most likely an ObscuredFloat / ObscuredInt (XOR-ed
+// storage). Those are read by calling the game's own op_Implicit, i.e. exactly what its code does.
+// Candidates = float / int / ObscuredFloat / ObscuredInt instance fields of the player class and of
+// Chillow.* classes reachable through up to two reference hops (inline structs are followed too).
+// Learn: snapshot all characters, user damages one, compare: the right field dropped on exactly one
+// character and did not move on any other.
+static const char *kObsF = "CodeStage.AntiCheat.ObscuredTypes.ObscuredFloat";
+static const char *kObsI = "CodeStage.AntiCheat.ObscuredTypes.ObscuredInt";
+struct HCand { uint8_t kind, nd; int off[3]; const char *n1, *n2; };   // kind 0 float, 1 int, 2 ObscuredFloat, 3 ObscuredInt
 static std::vector<HCand> g_hc;
-static HCand g_hpC = {0, 0, 0, 0};
+static HCand g_hpC = { 0, 0, { 0, 0, 0 }, nullptr, nullptr };
 static bool g_haveHp = false;
 static int g_hpLearn = 0;                 // 0 idle, 1 snapshot taken (waiting for the hit)
 static float g_hpRef = 0;                 // "full health" reference = highest value seen on the learned field
 static NSString *g_hpMsg = @"hp: not learned";
 static double g_hpMsgUntil = 0;
 static std::unordered_map<void *, std::vector<float>> g_hpSnap;
+static void *mi_obsF, *mi_obsI;
+static size_t g_hcObs = 0;
 
+// finds ObscuredFloat / ObscuredInt in whatever assembly holds ACTk and resolves their implicit conversions
+static bool g_obsTried = false;
+static void ensureObs() {
+    if (g_obsTried || !il2_domain_get) return;
+    g_obsTried = true;
+    size_t n = 0;
+    void **asms = il2_get_assemblies(il2_domain_get(), &n);
+    for (size_t i = 0; i < n; i++) {
+        void *img = il2_asm_image(asms[i]);
+        if (!img) continue;
+        void *kf = il2_class_from_name(img, "CodeStage.AntiCheat.ObscuredTypes", "ObscuredFloat");
+        void *ki = il2_class_from_name(img, "CodeStage.AntiCheat.ObscuredTypes", "ObscuredInt");
+        if (kf && !mi_obsF) mi_obsF = findMethod(kf, "op_Implicit", 1, kObsF);
+        if (ki && !mi_obsI) mi_obsI = findMethod(ki, "op_Implicit", 1, kObsI);
+    }
+    NSLog(@"[SCESP] obscured: float op=%p int op=%p", mi_obsF, mi_obsI);
+}
 static bool readCand(const HCand &c, void *obj, float &out) {
     char *o = (char *)obj;
     if (!o) return false;
-    int off = c.off;
-    if (c.deref) { o = *(char **)(o + c.off); if (!o) return false; off = c.off2; }
-    if (c.isInt) out = (float)*(int *)(o + off); else out = *(float *)(o + off);
+    for (int i = 0; i < c.nd; i++) { o = *(char **)(o + c.off[i]); if (!o) return false; }
+    char *addr = o + c.off[c.nd];
+    switch (c.kind) {
+        case 0: out = *(float *)addr; break;
+        case 1: out = (float)*(int *)addr; break;
+        case 2: case 3: {
+            if (!g_obsTried) ensureObs();
+            void *mi = c.kind == 2 ? mi_obsF : mi_obsI;
+            if (!mi) return false;
+            void *args[1] = { addr };                 // value-type parameter = pointer to the struct data
+            void *r = inv(mi, nullptr, args);         // boxed result
+            if (!r) return false;
+            out = c.kind == 2 ? *(float *)((char *)r + 16) : (float)*(int *)((char *)r + 16);
+            break;
+        }
+        default: return false;
+    }
     return out == out;
 }
-static void pushHc(bool isInt, int off, int depth, int outer) {
-    if (g_hc.size() > 6000) return;
-    HCand c;
-    c.isInt = isInt ? 1 : 0;
-    if (depth) { c.deref = 1; c.off = outer; c.off2 = off; } else { c.deref = 0; c.off = off; c.off2 = 0; }
-    g_hc.push_back(c);
+static NSString *hpName(const HCand &c) {
+    static const char *kn[] = { "float", "int", "obsF", "obsI" };
+    return [NSString stringWithFormat:@"%s %s%s%s nd=%d off=%d/%d/%d", kn[c.kind & 3], c.n1 ? c.n1 : "", c.n1 ? "." : "", c.n2 ? c.n2 : "?", c.nd, c.off[0], c.off[1], c.off[2]];
 }
-static void scanHpClass(void *klass, int depth, int outer) {
+static void scanHpClass(void *klass, int nd, const int *path, int adj, int inl, const char *hop) {
     for (void *k = klass; k; k = il2_class_parent(k)) {
         void *iter = nullptr, *f;
         while ((f = il2_class_fields(k, &iter))) {
@@ -734,25 +841,45 @@ static void scanHpClass(void *klass, int depth, int outer) {
             void *ft = il2_field_type(f);
             const char *tn = ft ? il2_type_name(ft) : nullptr;
             if (!tn) continue;
-            int off = il2_field_offset(f);
-            bool fl = !strcmp(tn, "System.Single"), in = !strcmp(tn, "System.Int32");
-            if (fl || in) pushHc(in, off, depth, outer);
-            else if (depth == 0 && il2_class_from_type && il2_class_is_vt && !strncmp(tn, "Chillow.StandChillow.", 21)) {
+            int off = adj + il2_field_offset(f);
+            const char *fn = il2_field_name ? il2_field_name(f) : "?";
+            if (!strcmp(fn, "value__")) continue;
+            int kind = -1;
+            if (!strcmp(tn, "System.Single")) kind = 0;
+            else if (!strcmp(tn, "System.Int32")) kind = 1;
+            else if (!strcmp(tn, kObsF)) kind = 2;
+            else if (!strcmp(tn, kObsI)) kind = 3;
+            if (kind >= 0) {
+                if (kind == 2 && !mi_obsF && il2_class_from_type) { void *ok = il2_class_from_type(ft); if (ok) mi_obsF = findMethod(ok, "op_Implicit", 1, kObsF); }
+                if (kind == 3 && !mi_obsI && il2_class_from_type) { void *ok = il2_class_from_type(ft); if (ok) mi_obsI = findMethod(ok, "op_Implicit", 1, kObsI); }
+                if ((kind == 2 && !mi_obsF) || (kind == 3 && !mi_obsI)) continue;
+                if (g_hc.size() >= 30000) continue;
+                HCand c; c.kind = (uint8_t)kind; c.nd = (uint8_t)nd; c.n1 = hop; c.n2 = fn;
+                c.off[0] = c.off[1] = c.off[2] = 0;
+                for (int i = 0; i < nd; i++) c.off[i] = path[i];
+                c.off[nd] = off;
+                if (kind >= 2) g_hcObs++;
+                g_hc.push_back(c);
+            } else if (il2_class_from_type && il2_class_is_vt && !strncmp(tn, "Chillow.StandChillow.", 21)) {
                 void *nk = il2_class_from_type(ft);
-                if (nk && !il2_class_is_vt(nk)) scanHpClass(nk, 1, off);
+                if (!nk) continue;
+                if (il2_class_is_vt(nk)) { if (inl < 2) scanHpClass(nk, nd, path, off - 16, inl + 1, hop ? hop : fn); }
+                else if (nd < 2) { int np[3] = { path[0], path[1], path[2] }; np[nd] = off; scanHpClass(nk, nd + 1, np, 0, 0, hop ? hop : fn); }
             }
         }
     }
 }
 static void saveHp() {
     if (!g_haveHp) return;
-    [NSUserDefaults.standardUserDefaults setObject:@[@(g_hpC.deref), @(g_hpC.isInt), @(g_hpC.off), @(g_hpC.off2), @(g_hpRef)] forKey:@"scesp_hpc"];
+    [NSUserDefaults.standardUserDefaults setObject:@[@(g_hpC.kind), @(g_hpC.nd), @(g_hpC.off[0]), @(g_hpC.off[1]), @(g_hpC.off[2]), @(g_hpRef)] forKey:@"scesp_hpc2"];
 }
 static void loadHp() {
-    NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:@"scesp_hpc"];
-    if (a.count != 5) return;
-    g_hpC.deref = [a[0] intValue]; g_hpC.isInt = [a[1] intValue]; g_hpC.off = [a[2] intValue]; g_hpC.off2 = [a[3] intValue];
-    g_hpRef = [a[4] floatValue]; g_haveHp = true; g_hpMsg = @"hp: learned field loaded";
+    NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:@"scesp_hpc2"];
+    if (a.count != 6) return;
+    g_hpC.kind = [a[0] intValue]; g_hpC.nd = [a[1] intValue];
+    g_hpC.off[0] = [a[2] intValue]; g_hpC.off[1] = [a[3] intValue]; g_hpC.off[2] = [a[4] intValue];
+    g_hpRef = [a[5] floatValue]; g_haveHp = true; g_hpMsg = @"hp: learned field loaded";
+    // the method pointers for Obscured* are resolved lazily by the first learn; until then obscured fields read as "no value"
 }
 static void hpSay(NSString *m, double secs) { g_hpMsg = m; g_hpMsgUntil = CACurrentMediaTime() + secs; NSLog(@"[SCESP] %@", m); }
 
@@ -760,8 +887,10 @@ static void hpSay(NSString *m, double secs) { g_hpMsg = m; g_hpMsgUntil = CACurr
 static bool hpLearnTap() {
     if (g_hpLearn == 0) {
         if (g_active < 0 || !k_targets[g_active]) { hpSay(@"hp: no player class yet", 5); return false; }
-        g_hc.clear(); g_hpSnap.clear();
-        scanHpClass(k_targets[g_active], 0, 0);
+        ensureObs();
+        g_hc.clear(); g_hpSnap.clear(); g_hcObs = 0;
+        int path[3] = { 0, 0, 0 };
+        scanHpClass(k_targets[g_active], 0, path, 0, 0, nullptr);
         for (auto &pi : g_pl) {
             void *o = il2_gc_get(pi.obj);
             if (!alive(o)) continue;
@@ -771,7 +900,7 @@ static bool hpLearnTap() {
         }
         if (g_hpSnap.size() < 2) { hpSay(@"hp: need 2+ characters in the scene", 6); return false; }
         g_hpLearn = 1;
-        hpSay([NSString stringWithFormat:@"hp: %zuf/%zuch - hit 1 enemy once, tap again", g_hc.size(), g_hpSnap.size()], 600);
+        hpSay([NSString stringWithFormat:@"hp: %zuf %zuobs - hit 1 enemy, tap", g_hc.size(), g_hcObs], 600);
         return true;
     }
     g_hpLearn = 0;
@@ -792,13 +921,31 @@ static bool hpLearnTap() {
         for (auto &kv : g_hpSnap) if (kv.second[i] == before) score++;
         if (score > bestScore) { bestScore = score; best = (int)i; bestBefore = before; }
     }
-    if (best < 0) { hpSay(@"hp: no match - hit ONE enemy once, retry", 8); g_hpSnap.clear(); return false; }
+    if (best < 0) {
+        // report: everything that dropped on at least one character, to see what the game really changed
+        NSMutableString *rp = [NSMutableString stringWithFormat:@"hp learn FAILED: cands=%zu obs=%zu chars=%zu\n", g_hc.size(), g_hcObs, g_hpSnap.size()];
+        int shown = 0;
+        for (size_t i = 0; i < g_hc.size() && shown < 40; i++) {
+            for (auto &kv : g_hpSnap) {
+                if (!alive(kv.first)) continue;
+                float b = kv.second[i], a;
+                if (b != b || !readCand(g_hc[i], kv.first, a)) continue;
+                if (a - b < -0.001f) { [rp appendFormat:@"%@  %.2f -> %.2f\n", hpName(g_hc[i]), b, a]; shown++; break; }
+            }
+        }
+        UIPasteboard.generalPasteboard.string = rp;
+        NSLog(@"[SCESP] %@", rp);
+        hpSay(@"hp: no match, report copied. hit ENEMY once", 12);
+        g_hpSnap.clear();
+        return false;
+    }
     g_hpC = g_hc[best]; g_haveHp = true;
     float ref = bestBefore;
     for (auto &kv : g_hpSnap) if (kv.second[best] == kv.second[best] && kv.second[best] > ref) ref = kv.second[best];
     g_hpRef = ref;
     saveHp();
-    hpSay([NSString stringWithFormat:@"hp OK %s off=%d/%d full=%.0f (%zu)", g_hpC.isInt ? "int" : "float", g_hpC.off, g_hpC.off2, g_hpRef, matches], 10);
+    UIPasteboard.generalPasteboard.string = hpName(g_hpC);
+    hpSay([NSString stringWithFormat:@"hp OK %s full=%.0f (%zu match)", g_hpC.kind >= 2 ? "obscured" : (g_hpC.kind ? "int" : "float"), g_hpRef, matches], 10);
     g_hpSnap.clear();
     return false;
 }
@@ -1079,7 +1226,7 @@ static NSString *diagRenderer(void *r) {
     UIButton *_btn, *_hpBtn;
     UIView *_panel;
     UILabel *_status;
-    UILabel *_lwLabel, *_hdLabel;
+    UILabel *_lwLabel, *_hdLabel, *_fovLabel;
     int _frame, _vfy;
     void *_diagR;
     double _lastTick, _lastScan;
@@ -1132,6 +1279,13 @@ static NSString *diagRenderer(void *r) {
     [self addSwitch:@"Low CPU" col:0 row:3 tag:6 on:g_set.lowcpu];
     [self addSwitch:@"No occlusion" col:1 row:3 tag:7 on:g_set.noocc];
     [self addSwitch:@"Head dot" col:0 row:4 tag:12 on:g_set.hdot];
+    _fovLabel = [[UILabel alloc] initWithFrame:CGRectMake(170, 126, 56, 24)];
+    _fovLabel.textColor = UIColor.whiteColor; _fovLabel.font = [UIFont systemFontOfSize:11];
+    [_panel addSubview:_fovLabel];
+    UISlider *s3 = [[UISlider alloc] initWithFrame:CGRectMake(226, 126, 94, 24)];
+    s3.minimumValue = 5; s3.maximumValue = 90; s3.value = g_set.fov; s3.tag = 13;
+    [s3 addTarget:self action:@selector(slChanged:) forControlEvents:UIControlEventValueChanged];
+    [_panel addSubview:s3];
 
     UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"R", @"G", @"C", @"Y", @"W", @"M", @"O"]];
     seg.frame = CGRectMake(10, 154, 310, 26);
@@ -1213,6 +1367,7 @@ static NSString *diagRenderer(void *r) {
 - (void)refreshLabels {
     _lwLabel.text = [NSString stringWithFormat:@"Line width: %.1f", g_set.lw];
     _hdLabel.text = [NSString stringWithFormat:@"Box height m: %.2f", g_set.head];
+    _fovLabel.text = [NSString stringWithFormat:@"Aim FOV %.0f", g_set.fov];
 }
 
 - (void)swChanged:(UISwitch *)s {
@@ -1233,7 +1388,7 @@ static NSString *diagRenderer(void *r) {
 }
 - (void)segChanged:(UISegmentedControl *)s { g_set.color = (int)s.selectedSegmentIndex; g_dirty = true; saveSettings(); }
 - (void)slChanged:(UISlider *)s {
-    if (s.tag == 10) g_set.lw = s.value; else g_set.head = s.value;
+    if (s.tag == 10) g_set.lw = s.value; else if (s.tag == 13) g_set.fov = s.value; else g_set.head = s.value;
     [self refreshLabels]; saveSettings();
 }
 - (void)plateTapped { _panel.hidden = !_panel.hidden; }
@@ -1452,8 +1607,10 @@ static NSString *diagRenderer(void *r) {
                         learnStep(meObj, aimObj, curYaw, curPit);
                         if (now - g_learnT0 > 6.0) learnFinish();
                         else g_learnMsg = [NSString stringWithFormat:@"learning %.0fs: turn LEFT/RIGHT and UP/DOWN", 6.0 - (now - g_learnT0)];
+                    } else if (g_probeAxis >= 0) {
+                        probeStep(meObj, aimObj, curYaw, curPit, now);
                     } else if (g_set.aim && g_haveYaw && g_havePit && !tg.empty()) {
-                        float best = kAimFov, dyB = 0, dpB = 0; bool got = false;
+                        float best = g_set.fov, dyB = 0, dpB = 0; bool got = false;
                         for (auto &t : tg) {
                             float dx = t.x - camPos.x, dy = t.y - camPos.y, dz = t.z - camPos.z;
                             float len = sqrtf(dx * dx + dy * dy + dz * dz);
@@ -1510,10 +1667,10 @@ static NSString *diagRenderer(void *r) {
         NSMutableString *cs = [NSMutableString string];
         for (int i = 0; i < kN; i++) [cs appendFormat:@"%s%zu", i ? "/" : "", g_counts[i]];
         NSString *sh = g_chamShaderUsed ? [NSString stringWithUTF8String:g_chamShaderUsed] : (g_chamFailed ? @"no shader" : @"-");
-        _status.text = [NSString stringWithFormat:@"found %@ | team f%d me%d | draw %d | cam %@\nchams: %@ | %s | %zu on re%d | occ %s(%zu)",
-                        cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", sh,
-                        g_chamMode == 2 ? "NO x-ray" : "x-ray", g_chams.size(), g_chamReapply,
-                        g_occOff ? "off" : "on", g_occ.size()];
+        _status.text = [NSString stringWithFormat:@"found %@ | team f%d me%d | draw %d | cam %@\nchams %@ %s %zu re%d | occ %s",
+                        cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", [sh lastPathComponent],
+                        g_chamMode == 2 ? "noX" : "xray", g_chams.size(), g_chamReapply,
+                        g_occOff ? "off" : "on"];
         @try {
             NSString *l3 = (g_learn || now < g_msgUntil) ? g_learnMsg
                          : (g_set.aim ? ((g_haveYaw && g_havePit) ? @"aim: ON, look fields learned" : @"aim: ON but NOT learned -> Learn look fields")
