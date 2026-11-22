@@ -1,4 +1,4 @@
-// SCESP.mm v5.4 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.5 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -153,6 +153,7 @@ typedef bool (*ic_get_bool)(void *);
 static fn_resolve_icall il2_resolve_icall;
 static ic_set_bool ic_cam_set_occ;
 static ic_get_bool ic_cam_get_occ, ic_rend_vis;
+static ic_set_bool ic_rend_set_allow;
 
 struct V3 { float x, y, z; };
 struct Col { float r, g, b, a; };
@@ -250,7 +251,7 @@ static void *mi_set_color, *mi_set_queue, *mi_setint, *mi_setglobal, *mi_get_nam
 static void *k_animator, *k_occsys;
 static void *mi_anim_cull, *mi_beh_enabled, *mi_smr_offscreen, *mi_rend_enabled, *mi_cam_occ;
 static void *mi_rend_get_enabled, *mi_rend_isvis, *mi_rend_get_froff, *mi_rend_set_froff, *mi_cam_get_occ;
-static void *mi_get_go, *mi_go_active, *mi_go_layer;
+static void *mi_get_go, *mi_go_active, *mi_go_layer, *mi_rend_allow;
 
 static d_get_main d_cam_main;  static void *mi_cam_main;
 static d_obj_get d_tr;         static void *mi_tr;
@@ -313,6 +314,7 @@ static bool resolveAll() {
             mi_rend_isvis       = il2_get_method(cRend, "get_isVisible", 0);
             mi_rend_get_froff   = il2_get_method(cRend, "get_forceRenderingOff", 0);
             mi_rend_set_froff   = il2_get_method(cRend, "set_forceRenderingOff", 1);
+            mi_rend_allow       = il2_get_method(cRend, "set_allowOcclusionWhenDynamic", 1);
         }
         mi_cam_get_occ = il2_get_method(cCamera, "get_useOcclusionCulling", 0);
         mi_get_go = il2_get_method(cComp, "get_gameObject", 0);
@@ -346,10 +348,12 @@ static bool resolveAll() {
     for (int i = 0; i < kN; i++) k_targets[i] = il2_class_from_name(game, kTargets[i].ns, kTargets[i].name);
     k_aim = il2_class_from_name(game, "Chillow.StandChillow.Player.Aim", "AimController");
     if (il2_resolve_icall) {
-        ic_cam_set_occ = (ic_set_bool)il2_resolve_icall("UnityEngine.Camera::set_useOcclusionCulling(System.Boolean)");
-        ic_cam_get_occ = (ic_get_bool)il2_resolve_icall("UnityEngine.Camera::get_useOcclusionCulling()");
-        ic_rend_vis    = (ic_get_bool)il2_resolve_icall("UnityEngine.Renderer::get_isVisible()");
-        NSLog(@"[SCESP] icalls: setOcc=%p getOcc=%p isVisible=%p", ic_cam_set_occ, ic_cam_get_occ, ic_rend_vis);
+        auto ic = [](const char *a, const char *b) -> void * { void *p = il2_resolve_icall(a); return p ? p : il2_resolve_icall(b); };
+        ic_cam_set_occ   = (ic_set_bool)ic("UnityEngine.Camera::set_useOcclusionCulling(System.Boolean)", "UnityEngine.Camera::set_useOcclusionCulling");
+        ic_cam_get_occ   = (ic_get_bool)ic("UnityEngine.Camera::get_useOcclusionCulling()", "UnityEngine.Camera::get_useOcclusionCulling");
+        ic_rend_vis      = (ic_get_bool)ic("UnityEngine.Renderer::get_isVisible()", "UnityEngine.Renderer::get_isVisible");
+        ic_rend_set_allow = (ic_set_bool)ic("UnityEngine.Renderer::set_allowOcclusionWhenDynamic(System.Boolean)", "UnityEngine.Renderer::set_allowOcclusionWhenDynamic");
+        NSLog(@"[SCESP] icalls: setOcc=%p getOcc=%p isVisible=%p allowOcc=%p", ic_cam_set_occ, ic_cam_get_occ, ic_rend_vis, ic_rend_set_allow);
     }
     NSLog(@"[SCESP] resolve: find=%p cam=%p w2s=%p tr=%p pos=%p parent=%p bones=%p",
           mi_find, d_cam_main, d_world2screen, d_tr, d_pos, d_parent, mi_get_bones);
@@ -662,6 +666,10 @@ static void setOcclusion(bool disabled) {
     g_occOff = disabled;
 }
 
+static void setAllowOcc(void *r) {      // dynamic renderers are not occlusion-culled when this is false
+    if (ic_rend_set_allow) ic_rend_set_allow(r, false);
+    else if (mi_rend_allow) { bool f = false; void *a[1] = { &f }; inv(mi_rend_allow, r, a); }
+}
 static void forceVisible(bool full) {
     // Only enemy bodies: never "me" (the camera's own third-person body must stay hidden) and
     // never the first-person arms meshes (they float in the air if switched on).
@@ -685,10 +693,12 @@ static void forceVisible(bool full) {
                 bool t = true; void *a[1] = { &t };
                 inv(mi_rend_enabled, r, a);
                 { bool f = false; void *a2[1] = { &f }; inv(mi_rend_set_froff, r, a2); }
+                setAllowOcc(r);
                 if (full) inv(mi_smr_offscreen, r, a);
             }
         }
         if (!full) continue;
+        for (uint32_t h : p.smr) { void *r2 = il2_gc_get(h); if (alive(r2)) setAllowOcc(r2); }
         for (uint32_t h : p.anim) {
             void *an = il2_gc_get(h);
             if (!alive(an)) continue;
@@ -891,7 +901,9 @@ static NSString *diagRenderer(void *r) {
     if (go) { act = mi_go_active ? unboxBool(inv(mi_go_active, go, nullptr)) : -1; layer = mi_go_layer ? unboxInt(inv(mi_go_layer, go, nullptr)) : -1; }
     void *cam = d_cam_main(mi_cam_main);
     int co = (cam && ic_cam_get_occ) ? (int)ic_cam_get_occ(cam) : ((cam && mi_cam_get_occ) ? unboxBool(inv(mi_cam_get_occ, cam, nullptr)) : -1);
-    return [NSString stringWithFormat:@"diag e%d v%d f%d act%d L%d camOcc%d", en, vis, fo, act, layer, co];
+    (void)fo;
+    return [NSString stringWithFormat:@"e%d v%d a%d L%d o%d ic%d%d%d%d r%d", en, vis, act, layer, co,
+            ic_cam_set_occ ? 1 : 0, ic_cam_get_occ ? 1 : 0, ic_rend_vis ? 1 : 0, ic_rend_set_allow ? 1 : 0, il2_resolve_icall ? 1 : 0];
 }
 
 // ---- UI --------------------------------------------------------------------------------
