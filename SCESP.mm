@@ -1,6 +1,6 @@
 // SCESP.mm v5.5 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
-// Box / skeleton / chams / box fill, enemies only (teammates optional), settings panel.
+// Box / skeleton / chams / box fill / health bar, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
 //
 // - everything is resolved by class/method name at runtime through the exported il2cpp API
@@ -8,6 +8,9 @@
 // - skeleton = real bones of each character's biggest SkinnedMeshRenderer, parent->child lines
 // - chams = swaps the enemy's materials for an unlit colour material that ignores depth
 //   (needs a built-in shader that exists in the build; the panel shows which one it found)
+// - health bar = vertical bar left of the box. The health field is obfuscated, so it is LEARNED:
+//   panel "Learn health" -> hit one bot once -> tap again. The field that dropped on exactly one
+//   character (and stayed put on all others) is stored and read every tick.
 // - hot path uses direct method-pointer calls; drawing is 30 fps, scan about once a second
 //
 // Not compiled or run on a device by me. If something misbehaves, the panel's status line says where.
@@ -43,7 +46,7 @@ static const float kAimFov = 18.0f;   // degrees: aim lock only grabs targets th
 
 // ---- settings --------------------------------------------------------------------------
 struct Settings {
-    bool on = true, box = true, skel = true, chams = false, fill = false, team = false, lowcpu = false, noocc = true, aim = false;
+    bool on = true, box = true, skel = true, chams = false, fill = false, team = false, lowcpu = false, noocc = true, aim = false, hp = true;
     int color = 0;
     float lw = 1.5f;
     float head = 1.8f;
@@ -69,6 +72,7 @@ static void saveSettings() {
     [d setBool:g_set.fill forKey:@"scesp_fill"];   [d setBool:g_set.team forKey:@"scesp_team"];
     [d setBool:g_set.lowcpu forKey:@"scesp_low"];
     [d setBool:g_set.noocc forKey:@"scesp_noocc"];
+    [d setBool:g_set.hp forKey:@"scesp_hp"];
     [d setInteger:g_set.color forKey:@"scesp_color"];
     [d setFloat:g_set.lw forKey:@"scesp_lw"];      [d setFloat:g_set.head forKey:@"scesp_head"];
 }
@@ -80,6 +84,7 @@ static void loadSettings() {
     g_set.fill = [d boolForKey:@"scesp_fill"];     g_set.team = [d boolForKey:@"scesp_team"];
     g_set.lowcpu = [d boolForKey:@"scesp_low"];
     g_set.noocc = [d objectForKey:@"scesp_noocc"] ? [d boolForKey:@"scesp_noocc"] : true;
+    g_set.hp = [d objectForKey:@"scesp_hp"] ? [d boolForKey:@"scesp_hp"] : true;
     g_set.color = (int)[d integerForKey:@"scesp_color"];
     g_set.lw = [d floatForKey:@"scesp_lw"];        g_set.head = [d floatForKey:@"scesp_head"];
     if (g_set.lw < 0.5f) g_set.lw = 1.5f;
@@ -642,6 +647,112 @@ static void rescan(bool wantBones) {
     g_pl.swap(fresh);
 }
 
+// ---- health bar ------------------------------------------------------------------------
+// Candidates = every int / float instance field of the player class (and of Chillow.* reference fields
+// one level deep). Learn: snapshot all characters, user damages one bot, compare. The right field
+// dropped on exactly one character and did not move on any other.
+struct HCand { uint8_t deref, isInt; int off, off2; };
+static std::vector<HCand> g_hc;
+static HCand g_hpC = {0, 0, 0, 0};
+static bool g_haveHp = false;
+static int g_hpLearn = 0;                 // 0 idle, 1 snapshot taken (waiting for the hit)
+static float g_hpRef = 0;                 // "full health" reference = highest value seen on the learned field
+static NSString *g_hpMsg = @"health: not learned";
+static double g_hpMsgUntil = 0;
+static std::unordered_map<void *, std::vector<float>> g_hpSnap;
+
+static bool readCand(const HCand &c, void *obj, float &out) {
+    char *o = (char *)obj;
+    if (!o) return false;
+    int off = c.off;
+    if (c.deref) { o = *(char **)(o + c.off); if (!o) return false; off = c.off2; }
+    if (c.isInt) out = (float)*(int *)(o + off); else out = *(float *)(o + off);
+    return out == out;
+}
+static void pushHc(bool isInt, int off, int depth, int outer) {
+    if (g_hc.size() > 6000) return;
+    HCand c;
+    c.isInt = isInt ? 1 : 0;
+    if (depth) { c.deref = 1; c.off = outer; c.off2 = off; } else { c.deref = 0; c.off = off; c.off2 = 0; }
+    g_hc.push_back(c);
+}
+static void scanHpClass(void *klass, int depth, int outer) {
+    for (void *k = klass; k; k = il2_class_parent(k)) {
+        void *iter = nullptr, *f;
+        while ((f = il2_class_fields(k, &iter))) {
+            if (il2_field_flags(f) & 0x10) continue;
+            void *ft = il2_field_type(f);
+            const char *tn = ft ? il2_type_name(ft) : nullptr;
+            if (!tn) continue;
+            int off = il2_field_offset(f);
+            bool fl = !strcmp(tn, "System.Single"), in = !strcmp(tn, "System.Int32");
+            if (fl || in) pushHc(in, off, depth, outer);
+            else if (depth == 0 && il2_class_from_type && il2_class_is_vt && !strncmp(tn, "Chillow.StandChillow.", 21)) {
+                void *nk = il2_class_from_type(ft);
+                if (nk && !il2_class_is_vt(nk)) scanHpClass(nk, 1, off);
+            }
+        }
+    }
+}
+static void saveHp() {
+    if (!g_haveHp) return;
+    [NSUserDefaults.standardUserDefaults setObject:@[@(g_hpC.deref), @(g_hpC.isInt), @(g_hpC.off), @(g_hpC.off2), @(g_hpRef)] forKey:@"scesp_hpc"];
+}
+static void loadHp() {
+    NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:@"scesp_hpc"];
+    if (a.count != 5) return;
+    g_hpC.deref = [a[0] intValue]; g_hpC.isInt = [a[1] intValue]; g_hpC.off = [a[2] intValue]; g_hpC.off2 = [a[3] intValue];
+    g_hpRef = [a[4] floatValue]; g_haveHp = true; g_hpMsg = @"health: learned field loaded";
+}
+static void hpSay(NSString *m, double secs) { g_hpMsg = m; g_hpMsgUntil = CACurrentMediaTime() + secs; NSLog(@"[SCESP] %@", m); }
+
+// returns true when the button should show the "waiting for hit" caption
+static bool hpLearnTap() {
+    if (g_hpLearn == 0) {
+        if (g_active < 0 || !k_targets[g_active]) { hpSay(@"health: no player class yet", 5); return false; }
+        g_hc.clear(); g_hpSnap.clear();
+        scanHpClass(k_targets[g_active], 0, 0);
+        for (auto &pi : g_pl) {
+            void *o = il2_gc_get(pi.obj);
+            if (!alive(o)) continue;
+            std::vector<float> v(g_hc.size(), NAN);
+            for (size_t i = 0; i < g_hc.size(); i++) { float x; if (readCand(g_hc[i], o, x)) v[i] = x; }
+            g_hpSnap[o] = std::move(v);
+        }
+        if (g_hpSnap.size() < 2) { hpSay(@"health: need me + at least one bot in the match", 6); return false; }
+        g_hpLearn = 1;
+        hpSay([NSString stringWithFormat:@"health: %zu fields, %zu chars. hit ONE bot once, then tap again", g_hc.size(), g_hpSnap.size()], 600);
+        return true;
+    }
+    g_hpLearn = 0;
+    int best = -1, bestScore = -1; size_t matches = 0; float bestBefore = 0;
+    for (size_t i = 0; i < g_hc.size(); i++) {
+        int dec = 0; bool bad = false; float before = 0;
+        for (auto &kv : g_hpSnap) {
+            if (!alive(kv.first)) continue;
+            float b = kv.second[i], a;
+            if (b != b || !readCand(g_hc[i], kv.first, a)) continue;
+            float d = a - b;
+            if (d < -0.5f && b > 0.5f && b < 100000.f && a >= -1.f) { dec++; before = b; }
+            else if (fabsf(d) > 0.001f) { bad = true; break; }
+        }
+        if (bad || dec != 1) continue;
+        matches++;
+        int score = 0;                                      // fields where everyone started on the same value look like "full health"
+        for (auto &kv : g_hpSnap) if (kv.second[i] == before) score++;
+        if (score > bestScore) { bestScore = score; best = (int)i; bestBefore = before; }
+    }
+    if (best < 0) { hpSay(@"health: nothing matched. hit a bot (not yourself) once and try again", 8); g_hpSnap.clear(); return false; }
+    g_hpC = g_hc[best]; g_haveHp = true;
+    float ref = bestBefore;
+    for (auto &kv : g_hpSnap) if (kv.second[best] == kv.second[best] && kv.second[best] > ref) ref = kv.second[best];
+    g_hpRef = ref;
+    saveHp();
+    hpSay([NSString stringWithFormat:@"health: OK %s off=%d/%d full=%.0f (%zu cand)", g_hpC.isInt ? "int" : "float", g_hpC.off, g_hpC.off2, g_hpRef, matches], 10);
+    g_hpSnap.clear();
+    return false;
+}
+
 // ---- occlusion override ----------------------------------------------------------------
 // The game hides occluded characters itself (OcclusionSystem -> ObjectOccludee), and animators of
 // hidden models stop updating (that is the T-pose). Turn that system off while skeleton/chams are on.
@@ -914,7 +1025,8 @@ static NSString *diagRenderer(void *r) {
 @implementation SCESPDriver {
     UIView *_overlay;
     CAShapeLayer *_boxes, *_skel;
-    UIButton *_btn;
+    CAShapeLayer *_hpBack, *_hpG, *_hpY, *_hpR;
+    UIButton *_btn, *_hpBtn;
     UIView *_panel;
     UILabel *_status;
     UILabel *_lwLabel, *_hdLabel;
@@ -945,7 +1057,7 @@ static NSString *diagRenderer(void *r) {
 }
 
 - (void)buildPanel {
-    _panel = [[UIView alloc] initWithFrame:CGRectMake(8, 72, 330, 312)];
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(8, 72, 330, 344)];
     _panel.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
     _panel.layer.cornerRadius = 10;
     _panel.hidden = YES;
@@ -1013,6 +1125,23 @@ static NSString *diagRenderer(void *r) {
     as.tag = 8; as.on = g_set.aim;
     [as addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:as];
+
+    _hpBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    _hpBtn.frame = CGRectMake(10, 312, 150, 26);
+    _hpBtn.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1]; _hpBtn.layer.cornerRadius = 6;
+    _hpBtn.titleLabel.font = [UIFont systemFontOfSize:12];
+    [_hpBtn setTitle:@"Learn health" forState:UIControlStateNormal];
+    [_hpBtn addTarget:self action:@selector(hpLearnTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_panel addSubview:_hpBtn];
+    UILabel *hl = [[UILabel alloc] initWithFrame:CGRectMake(170, 312, 96, 26)];
+    hl.text = @"Health bar"; hl.textColor = UIColor.whiteColor; hl.font = [UIFont systemFontOfSize:12];
+    [_panel addSubview:hl];
+    UISwitch *hs = [[UISwitch alloc] init];
+    hs.transform = (CGAffineTransform){ 0.68, 0, 0, 0.68, 0, 0 };
+    hs.center = CGPointMake(170 + 96 + 20, 325);
+    hs.tag = 9; hs.on = g_set.hp;
+    [hs addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
+    [_panel addSubview:hs];
     [self refreshLabels];
 }
 
@@ -1046,6 +1175,7 @@ static NSString *diagRenderer(void *r) {
         case 6: g_set.lowcpu = s.on; break;
         case 7: g_set.noocc = s.on; break;
         case 8: g_set.aim = s.on; break;
+        case 9: g_set.hp = s.on; break;
     }
     g_dirty = true; saveSettings();
 }
@@ -1064,6 +1194,11 @@ static NSString *diagRenderer(void *r) {
     if (k_aim) scanClass(k_aim, 1, 0, 0, 0);
     g_stats.assign(g_cands.size(), Stat());
     g_learn = true; g_learnT0 = CACurrentMediaTime();
+}
+- (void)hpLearnTapped {
+    if (!g_ready) return;
+    bool waiting = hpLearnTap();
+    [_hpBtn setTitle:waiting ? @"Hit a bot, tap" : @"Learn health" forState:UIControlStateNormal];
 }
 - (void)dumpTapped {
     if (!g_ready) { _status.text = @"dump: game not ready yet"; return; }
@@ -1113,12 +1248,20 @@ static NSString *diagRenderer(void *r) {
         _overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         _boxes = [CAShapeLayer layer]; _skel = [CAShapeLayer layer];
         _boxes.fillColor = UIColor.clearColor.CGColor; _skel.fillColor = UIColor.clearColor.CGColor;
+        _hpBack = [CAShapeLayer layer]; _hpG = [CAShapeLayer layer]; _hpY = [CAShapeLayer layer]; _hpR = [CAShapeLayer layer];
+        _hpBack.fillColor = [UIColor colorWithWhite:0 alpha:0.65].CGColor;
+        _hpG.fillColor = [UIColor colorWithRed:0.1 green:1 blue:0.2 alpha:1].CGColor;
+        _hpY.fillColor = [UIColor colorWithRed:1 green:0.85 blue:0.1 alpha:1].CGColor;
+        _hpR.fillColor = [UIColor colorWithRed:1 green:0.15 blue:0.15 alpha:1].CGColor;
         [_overlay.layer addSublayer:_boxes]; [_overlay.layer addSublayer:_skel];
+        for (CAShapeLayer *hl in @[_hpBack, _hpG, _hpY, _hpR]) { hl.strokeColor = nil; [_overlay.layer addSublayer:hl]; }
     }
     if (_overlay.superview != win) { [_overlay removeFromSuperview]; [win insertSubview:_overlay belowSubview:_btn]; }
 
     UIBezierPath *boxPath = [UIBezierPath bezierPath];
     UIBezierPath *skelPath = [UIBezierPath bezierPath];
+    UIBezierPath *hpBack = [UIBezierPath bezierPath], *hpG = [UIBezierPath bezierPath], *hpY = [UIBezierPath bezierPath], *hpR = [UIBezierPath bezierPath];
+    bool wantHp = g_set.hp && g_haveHp;
     int drawn = 0, myTeam = -1;
     bool camOk = false;
     std::vector<void *> wantChams;
@@ -1202,7 +1345,7 @@ static NSString *diagRenderer(void *r) {
                             [skelPath moveToPoint:sp[par]]; [skelPath addLineToPoint:sp[b]];
                         }
                     }
-                    if (g_set.box || g_set.fill) {
+                    if (g_set.box || g_set.fill || wantHp) {
                         CGRect r;
                         if (haveBones) {
                             CGFloat pad = 6;
@@ -1217,7 +1360,17 @@ static NSString *diagRenderer(void *r) {
                             CGFloat bw = bh * 0.5, cx = (hx + fx) * 0.5;
                             r = CGRectMake(cx - bw / 2, hy, bw, bh);
                         }
-                        [boxPath appendPath:[UIBezierPath bezierPathWithRect:r]];
+                        if (g_set.box || g_set.fill) [boxPath appendPath:[UIBezierPath bezierPathWithRect:r]];
+                        float hv;
+                        if (wantHp && readCand(g_hpC, p.obj, hv) && hv > 0.f && hv < 1e6f) {
+                            if (hv > g_hpRef) g_hpRef = hv;
+                            CGFloat ratio = fminf(1.f, hv / g_hpRef);
+                            CGFloat bw = fmax(3.0, g_set.lw * 2), bx = r.origin.x - bw - 3;
+                            [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
+                            CGFloat fh = r.size.height * ratio;
+                            UIBezierPath *tgt = ratio > 0.6 ? hpG : (ratio > 0.3 ? hpY : hpR);
+                            [tgt appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx, r.origin.y + r.size.height - fh, bw, fh)]];
+                        }
                     }
                     drawn++;
                 }
@@ -1280,6 +1433,8 @@ static NSString *diagRenderer(void *r) {
     _skel.strokeColor = colorFor(g_set.color, 1).CGColor;
     _boxes.lineWidth = g_set.lw; _skel.lineWidth = g_set.lw;
     _boxes.path = boxPath.CGPath; _skel.path = skelPath.CGPath;
+    for (CAShapeLayer *hl in @[_hpBack, _hpG, _hpY, _hpR]) hl.frame = _overlay.bounds;
+    _hpBack.path = hpBack.CGPath; _hpG.path = hpG.CGPath; _hpY.path = hpY.CGPath; _hpR.path = hpR.CGPath;
     [CATransaction commit];
 
     if (!_panel.hidden) {
@@ -1290,7 +1445,7 @@ static NSString *diagRenderer(void *r) {
                         cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", sh,
                         g_chamMode == 2 ? "NO x-ray" : "x-ray", g_chams.size(), g_chamReapply,
                         g_occOff ? "off" : "on", g_occ.size()];
-        @try { _status.text = [_status.text stringByAppendingFormat:@"\n%@", (g_learn || now < g_msgUntil) ? g_learnMsg : diagRenderer(diagR)]; } @catch (...) {}
+        @try { _status.text = [_status.text stringByAppendingFormat:@"\n%@", (g_hpLearn || now < g_hpMsgUntil) ? g_hpMsg : ((g_learn || now < g_msgUntil) ? g_learnMsg : diagRenderer(diagR))]; } @catch (...) {}
     }
 }
 @end
@@ -1305,6 +1460,7 @@ __attribute__((constructor)) static void scesp_init(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         loadSettings();
         loadAim();
+        loadHp();
         g_driver = [SCESPDriver new];
         // CoreFoundation is resolved at runtime so the dylib needs no extra link flags.
         cf_obs_create create = (cf_obs_create)dlsym(RTLD_DEFAULT, "CFRunLoopObserverCreateWithHandler");
