@@ -423,7 +423,10 @@ static bool transformIsAncestor(void *child, void *ancestor) {
 }
 static inline int readTeam(void *obj, int field) {
     if (field < 0 || field >= (int)g_teamOffsets.size()) return 0;
-    return *(int *)((char *)obj + g_teamOffsets[field]);
+    // Core.Team is an enum backed by System.Byte (metadata TypeDef #6509).
+    // Reading four bytes here also consumes neighbouring padding/fields and
+    // can make valid team IDs appear as unrelated large integers.
+    return (int)*(uint8_t *)((char *)obj + g_teamOffsets[field]);
 }
 
 // ---- aim lock (offline) ----------------------------------------------------------------
