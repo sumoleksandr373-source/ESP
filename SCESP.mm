@@ -1,4 +1,4 @@
-// SCESP.mm v5.5 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.6 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill / health bar, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -290,6 +290,7 @@ static void *mi_get_go, *mi_go_active, *mi_go_layer, *mi_rend_allow;
 static d_get_main d_cam_main;  static void *mi_cam_main;
 static d_obj_get d_tr;         static void *mi_tr;
 static d_obj_get d_parent;     static void *mi_parent;
+static d_obj_get d_root;       static void *mi_root;
 static d_get_position d_pos;   static void *mi_pos;
 static d_w2s d_world2screen;   static void *mi_w2s;
 static d_screen d_sw, d_sh;    static void *mi_sw, *mi_sh;
@@ -325,6 +326,7 @@ static bool resolveAll() {
     mi_tr       = il2_get_method(cComp, "get_transform", 0);
     mi_pos      = il2_get_method(cTrans, "get_position", 0);
     mi_parent   = il2_get_method(cTrans, "get_parent", 0);
+    mi_root     = il2_get_method(cTrans, "get_root", 0);   // optional: tie AimController to the local character
     mi_fwd      = il2_get_method(cTrans, "get_forward", 0);
     mi_sw       = il2_get_method(cScreen, "get_width", 0);
     mi_sh       = il2_get_method(cScreen, "get_height", 0);
@@ -332,6 +334,7 @@ static bool resolveAll() {
     d_world2screen = (d_w2s)direct(mi_w2s);
     d_tr  = (d_obj_get)direct(mi_tr);
     d_parent = (d_obj_get)direct(mi_parent);
+    d_root = (d_obj_get)direct(mi_root);
     d_fwd = (d_get_position)direct(mi_fwd);
     d_pos = (d_get_position)direct(mi_pos);
     d_sw  = (d_screen)direct(mi_sw);
@@ -410,6 +413,14 @@ static void findTeamFields(void *klass) {
 }
 
 static inline bool alive(void *obj) { return obj && *(void **)((char *)obj + 16) != nullptr; }
+static bool transformIsAncestor(void *child, void *ancestor) {
+    if (!child || !ancestor || !d_parent) return false;
+    for (int depth = 0; depth < 32 && child; depth++) {
+        if (child == ancestor) return true;
+        child = d_parent(child, mi_parent);
+    }
+    return false;
+}
 static inline int readTeam(void *obj, int field) {
     if (field < 0 || field >= (int)g_teamOffsets.size()) return 0;
     return *(int *)((char *)obj + g_teamOffsets[field]);
@@ -470,18 +481,30 @@ static float *candAddr(const Cand &c, void *me, void *aim) {
     if (c.deref) { char *p = *(char **)(o + c.off); return p ? (float *)(p + c.off2) : nullptr; }
     return (float *)(o + c.off);
 }
-static void *nearestAim(V3 cp) {
-    void *best = nullptr; float bd = 1e9f;
+static void *nearestAim(V3 cp, void *meObj) {
+    // Prefer an AimController on the same Transform root as the local player.
+    // The camera can be offset behind the player, so camera-distance alone can
+    // accidentally select a nearby bot's AimController.
+    void *meTr = (meObj && d_tr) ? d_tr(meObj, mi_tr) : nullptr;
+    V3 ref = meTr ? d_pos(meTr, mi_pos) : cp;
+    void *meRoot = (meTr && d_root) ? d_root(meTr, mi_root) : nullptr;
+    void *bestRoot = nullptr, *best = nullptr;
+    float rootDist = 1e9f, bd = 1e9f;
     for (uint32_t h : g_aimH) {
         void *o = il2_gc_get(h);
         if (!alive(o)) continue;
         void *tr = d_tr(o, mi_tr);
         if (!tr) continue;
         V3 q = d_pos(tr, mi_pos);
-        float dx = q.x - cp.x, dy = q.y - cp.y, dz = q.z - cp.z, d = dx * dx + dy * dy + dz * dz;
-        if (d < bd) { bd = d; best = o; }
+        float dx = q.x - ref.x, dy = q.y - ref.y, dz = q.z - ref.z;
+        float d = dx * dx + dy * dy + dz * dz;
+        if (meRoot && d_root && d_root(tr, mi_root) == meRoot) {
+            if (d < rootDist) { rootDist = d; bestRoot = o; }
+        } else if (d < bd) {
+            bd = d; best = o;
+        }
     }
-    return best;
+    return bestRoot ? bestRoot : best;
 }
 static void saveAim() {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -731,13 +754,29 @@ static void rescan(bool wantBones) {
     for (uint32_t h : g_aimH) il2_gc_free(h);
     g_aimH.clear();
     if (k_aim) { std::vector<void *> ao; findObjs(k_aim, ao, 32); for (void *x : ao) g_aimH.push_back(il2_gc_new(x, 0)); }
-    if (g_active >= 0 && k_targets[g_active]) g_counts[g_active] = findObjs(k_targets[g_active], objs, 64);
-    if (objs.empty()) {
-        for (int t = 0; t < kN; t++) {
-            if (!k_targets[t]) continue;
-            g_counts[t] = findObjs(k_targets[t], objs, 64);
-            if (g_counts[t] > 0) { if (g_active != t) { g_active = t; findTeamFields(k_targets[t]); } break; }
+    // Gather every known player-controller type. The previous code stopped at
+    // the first non-empty class, which could return only the local PlayerController
+    // and omit bots exposed through BotPlayerController / CharacterPlayer.
+    std::unordered_map<void *, bool> seen;
+    int firstActive = -1;
+    for (int t = 0; t < kN; t++) {
+        if (!k_targets[t]) continue;
+        std::vector<void *> typed;
+        g_counts[t] = findObjs(k_targets[t], typed, 64);
+        if (g_counts[t] > 0 && firstActive < 0) firstActive = t;
+        for (void *x : typed) {
+            if (!x) continue;
+            // The same character may expose more than one controller component.
+            // Deduplicate components on the same GameObject when that API exists.
+            void *key = mi_get_go ? inv(mi_get_go, x, nullptr) : nullptr;
+            if (!key) key = x;
+            if (seen.emplace(key, true).second) objs.push_back(x);
         }
+    }
+    if (firstActive != g_active) {
+        g_active = firstActive;
+        if (g_active >= 0) findTeamFields(k_targets[g_active]);
+        else { g_teamOffsets.clear(); g_teamField = -1; }
     }
 
     std::vector<PlayerInfo> fresh(objs.size());
@@ -1743,7 +1782,10 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                     if (!tr) continue;
                     V3 pos = d_pos(tr, mi_pos);
                     float dx = pos.x - camPos.x, dz = pos.z - camPos.z;
-                    ps.push_back({ &pi, obj, pos, dx * dx + dz * dz < kSelfRadius * kSelfRadius });
+                    // The camera may be offset from the body in third-person view.
+                    // Prefer its actual Transform ancestry, then use the old proximity fallback.
+                    bool cameraChild = transformIsAncestor(ctr, tr);
+                    ps.push_back({ &pi, obj, pos, cameraChild || dx * dx + dz * dz < kSelfRadius * kSelfRadius });
                 }
                 if (g_teamField < 0 && !g_teamOffsets.empty()) {
                     for (int f = 0; f < (int)g_teamOffsets.size(); f++) {
@@ -1761,7 +1803,9 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                     if (p.self) continue;
                     if (g_teamField >= 0) {
                         int tv = readTeam(p.obj, g_teamField);
-                        if (tv != 1 && tv != 2) continue;
+                        // Offline bots can briefly report Team::None (0). Keep those
+                        // candidates; only discard spectators and known teammates.
+                        if (tv == 3) continue;
                         if (!g_set.team && (myTeam == 1 || myTeam == 2) && tv == myTeam) continue;
                     }
                     PlayerInfo &pi = *p.pi;
@@ -1870,7 +1914,7 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                     V3 f = d_fwd(ctr, mi_fwd);
                     float curYaw = atan2f(f.x, f.z) * 57.29578f;
                     float curPit = -asinf(fmaxf(-1.f, fminf(1.f, f.y))) * 57.29578f;
-                    void *aimObj = nearestAim(camPos);
+                    void *aimObj = nearestAim(camPos, meObj);
                     if (g_learn) {
                         learnStep(meObj, aimObj, curYaw, curPit);
                         if (now - g_learnT0 > 6.0) learnFinish();
