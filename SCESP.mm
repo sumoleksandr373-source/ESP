@@ -502,7 +502,7 @@ static void reconcileChams(const std::vector<void *> &want) {
     UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, y, 160, 26)];
     l.text = title; l.textColor = UIColor.whiteColor; l.font = [UIFont systemFontOfSize:13];
     UISwitch *s = [[UISwitch alloc] initWithFrame:CGRectMake(170, y, 0, 0)];
-    s.transform = CGAffineTransformMakeScale(0.7, 0.7);
+    s.transform = (CGAffineTransform){ 0.7, 0, 0, 0.7, 0, 0 };
     s.tag = tag; s.on = on;
     [s addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:l]; [_panel addSubview:s];
@@ -659,7 +659,7 @@ static void reconcileChams(const std::vector<void *> &want) {
 
                     // bones -> screen
                     size_t nb = pi.bone.size();
-                    sp.assign(nb, CGPointZero); okp.assign(nb, 0);
+                    sp.assign(nb, CGPointMake(0, 0)); okp.assign(nb, 0);
                     float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
                     int good = 0;
                     for (size_t b = 0; b < nb; b++) {
