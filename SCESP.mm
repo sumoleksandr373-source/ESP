@@ -1,4 +1,4 @@
-// SCESP.mm v4 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -18,6 +18,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <vector>
+#include <unordered_map>
+#include <ctype.h>
 
 // ---- config ----------------------------------------------------------------------------
 static const char *kGameImage = "Chillow.StandChillow.Client.dll";
@@ -31,7 +33,11 @@ static const int   kN = sizeof(kTargets) / sizeof(kTargets[0]);
 static const char *kTeamType = "Chillow.StandChillow.Core.Team";   // None=0 Tr=1 Ct=2 Spectator=3
 static const float kSelfRadius = 0.7f;
 static const int   kRefreshTicks = 30;
-static const char *kChamShaders[] = { "Hidden/Internal-Colored", "UI/Default", "Sprites/Default" };
+static const char *kChamShaders[] = { "Hidden/Internal-Colored", "GUI/Text Shader", "UI/Default", "Sprites/Default" };
+// bones whose lowercase name contains any of these are never drawn and never count for the box
+static const char *kBoneSkip[] = { "root", "ik", "target", "pole", "weapon", "gun" };
+// bones further than this from the player pivot are junk (IK helpers, world-origin bones)
+static const float kBelowFeet = 0.3f, kMaxReach = 2.0f;
 
 // ---- settings --------------------------------------------------------------------------
 struct Settings {
@@ -104,6 +110,8 @@ typedef void *(*fn_method_get_param)(void *, uint32_t);
 typedef void *(*fn_string_new)(const char *);
 typedef void *(*fn_object_new)(void *);
 typedef void *(*fn_array_new)(void *, uintptr_t);
+typedef const uint16_t *(*fn_string_chars)(void *);
+typedef int (*fn_string_length)(void *);
 
 static fn_domain_get il2_domain_get;
 static fn_domain_get_assemblies il2_get_assemblies;
@@ -130,6 +138,8 @@ static fn_method_get_param il2_method_param;
 static fn_string_new il2_string_new;
 static fn_object_new il2_object_new;
 static fn_array_new il2_array_new;
+static fn_string_chars il2_str_chars;
+static fn_string_length il2_str_len;
 
 struct V3 { float x, y, z; };
 struct Col { float r, g, b, a; };
@@ -172,6 +182,8 @@ static bool loadApi() {
     il2_string_new      = (fn_string_new)sym("il2cpp_string_new");
     il2_object_new      = (fn_object_new)sym("il2cpp_object_new");
     il2_array_new       = (fn_array_new)sym("il2cpp_array_new");
+    il2_str_chars       = (fn_string_chars)sym("il2cpp_string_chars");     // optional (bone names)
+    il2_str_len         = (fn_string_length)sym("il2cpp_string_length");   // optional
     return il2_domain_get && il2_get_assemblies && il2_asm_image && il2_image_name &&
            il2_class_from_name && il2_get_method && il2_invoke && il2_class_type &&
            il2_type_object && il2_gc_new && il2_gc_get && il2_gc_free && il2_class_fields &&
@@ -218,7 +230,7 @@ static int g_teamField = -1;
 
 static void *k_smr, *k_material, *k_shader;
 static void *mi_find, *mi_get_bones, *mi_get_smats, *mi_set_smats, *mi_find_shader, *mi_mat_ctor;
-static void *mi_set_color, *mi_set_queue, *mi_setint, *mi_setglobal;
+static void *mi_set_color, *mi_set_queue, *mi_setint, *mi_setglobal, *mi_get_name, *mi_hasprop;
 static void *k_animator, *k_occsys;
 static void *mi_anim_cull, *mi_beh_enabled, *mi_smr_offscreen, *mi_rend_enabled, *mi_cam_occ;
 
@@ -250,6 +262,7 @@ static bool resolveAll() {
     k_shader      = il2_class_from_name(core, "UnityEngine", "Shader");
     if (!cObject || !cCamera || !cComp || !cTrans || !cScreen) return false;
 
+    mi_get_name = il2_get_method(cObject, "get_name", 0);
     // FindObjectsOfType(Type) is stripped in this build; (Type, bool) is present.
     mi_find     = il2_get_method(cObject, "FindObjectsOfType", 2);
     mi_cam_main = il2_get_method(cCamera, "get_main", 0);
@@ -295,6 +308,7 @@ static bool resolveAll() {
         mi_set_color = il2_get_method(k_material, "set_color", 1);
         mi_set_queue = il2_get_method(k_material, "set_renderQueue", 1);
         mi_setint    = findMethod(k_material, "SetInt", 2, "System.String");
+        mi_hasprop   = findMethod(k_material, "HasProperty", 1, "System.String");
     }
 
     for (int i = 0; i < kN; i++) k_targets[i] = il2_class_from_name(game, kTargets[i].ns, kTargets[i].name);
@@ -325,6 +339,7 @@ static inline int readTeam(void *obj, int field) {
 
 // ---- scene scan ------------------------------------------------------------------------
 struct PlayerInfo {
+    std::vector<char> skip;         // per bone: junk bone (by name), never drawn
     uint32_t obj = 0;
     std::vector<uint32_t> smr;      // SkinnedMeshRenderer handles belonging to this player
     std::vector<uint32_t> anim;     // Animator handles belonging to this player
@@ -333,6 +348,29 @@ struct PlayerInfo {
     std::vector<int> parent;        // parent index inside `bone`, or -1
 };
 static std::vector<PlayerInfo> g_pl;
+
+static std::unordered_map<void *, char> g_skipCache;
+static int g_dumped = 0;
+static bool boneNameSkip(void *tr) {
+    auto it = g_skipCache.find(tr);
+    if (it != g_skipCache.end()) return it->second;
+    bool skip = false;
+    if (mi_get_name && il2_str_chars && il2_str_len) {
+        void *str = inv(mi_get_name, tr, nullptr);
+        if (str) {
+            int len = il2_str_len(str);
+            const uint16_t *ch = il2_str_chars(str);
+            char buf[96]; int n = len < 95 ? len : 95; if (n < 0) n = 0;
+            for (int i = 0; i < n; i++) buf[i] = ch[i] < 128 ? (char)tolower(ch[i]) : '?';
+            buf[n] = 0;
+            for (const char *k : kBoneSkip) if (strstr(buf, k)) { skip = true; break; }
+            if (g_dumped < 90) { g_dumped++; NSLog(@"[SCESP] bone '%s'%s", buf, skip ? " (skipped)" : ""); }
+        }
+    }
+    if (g_skipCache.size() > 8192) g_skipCache.clear();
+    g_skipCache[tr] = skip;
+    return skip;
+}
 
 static void freeInfo(PlayerInfo &p) {
     if (p.obj) il2_gc_free(p.obj);
@@ -416,7 +454,11 @@ static void rescan(bool wantBones) {
             if (bestN > 160) bestN = 160;
             void **bones = (void **)((char *)best + 32);
             std::vector<void *> bp;
-            for (uintptr_t b = 0; b < bestN; b++) { bp.push_back(bones[b]); fresh[i].bone.push_back(bones[b] ? il2_gc_new(bones[b], 0) : 0); }
+            for (uintptr_t b = 0; b < bestN; b++) {
+                bp.push_back(bones[b]);
+                fresh[i].bone.push_back(bones[b] ? il2_gc_new(bones[b], 0) : 0);
+                fresh[i].skip.push_back(bones[b] ? (char)boneNameSkip(bones[b]) : 1);
+            }
             for (uintptr_t b = 0; b < bestN; b++) {
                 int pi = -1;
                 if (bp[b]) {
@@ -455,7 +497,7 @@ static void setOcclusion(bool disabled) {
     g_occOff = disabled;
 }
 
-static void forceVisible() {
+static void forceVisible(bool full) {
     // Only enemy bodies: never "me" (the camera's own third-person body must stay hidden) and
     // never the first-person arms meshes (they float in the air if switched on).
     void *cam = d_cam_main(mi_cam_main);
@@ -476,9 +518,10 @@ static void forceVisible() {
             if (alive(r)) {
                 bool t = true; void *a[1] = { &t };
                 inv(mi_rend_enabled, r, a);
-                inv(mi_smr_offscreen, r, a);
+                if (full) inv(mi_smr_offscreen, r, a);
             }
         }
+        if (!full) continue;
         for (uint32_t h : p.anim) {
             void *an = il2_gc_get(h);
             if (!alive(an)) continue;
@@ -512,26 +555,42 @@ static void updateChamColor() {
     void *args[1] = { &c };
     inv(mi_set_color, mat, args);
 }
+static bool matHasProp(void *mat, const char *name) {
+    if (!mi_hasprop) return true;                       // cannot check: assume yes
+    void *args[1] = { il2_string_new(name) };
+    void *r = inv(mi_hasprop, mat, args);
+    return r ? *(bool *)((char *)r + 16) : false;       // boxed bool
+}
+static int g_chamReapply = 0;
 static bool ensureChamMaterial() {
     if (g_chamMat) return true;
     if (g_chamFailed || !mi_find_shader || !mi_mat_ctor || !k_material) { g_chamFailed = true; return false; }
-    void *shader = nullptr;
+    void *chosen = nullptr, *fallback = nullptr;
+    const char *used = nullptr, *fallbackName = nullptr;
+    int mode = 2;
     for (const char *nm : kChamShaders) {
         void *args[1] = { il2_string_new(nm) };
-        shader = inv(mi_find_shader, nullptr, args);
-        if (shader) { g_chamShaderUsed = nm; break; }
+        void *shader = inv(mi_find_shader, nullptr, args);
+        if (!shader) continue;
+        void *mat = il2_object_new(k_material);
+        if (!mat) continue;
+        void *cargs[1] = { shader };
+        inv(mi_mat_ctor, mat, cargs);
+        int m = 2;
+        if (!strcmp(nm, "Hidden/Internal-Colored")) m = matHasProp(mat, "_ZTest") ? 0 : 2;   // 0 = _ZTest property
+        else if (!strcmp(nm, "GUI/Text Shader"))    m = 3;                                    // 3 = ZTest Always baked in
+        else if (!strcmp(nm, "UI/Default"))         m = mi_setglobal ? 1 : 2;                 // 1 = via global
+        if (m != 2) { chosen = mat; mode = m; used = nm; break; }
+        if (!fallback) { fallback = mat; fallbackName = nm; }
     }
-    if (!shader) { g_chamFailed = true; return false; }
-    void *mat = il2_object_new(k_material);
-    void *cargs[1] = { shader };
-    if (!mat || (inv(mi_mat_ctor, mat, cargs), false)) { g_chamFailed = true; return false; }
-    g_chamMat = il2_gc_new(mat, 0);
-    if (strcmp(g_chamShaderUsed, "Hidden/Internal-Colored") == 0) g_chamMode = 0;
-    else if (strcmp(g_chamShaderUsed, "UI/Default") == 0 && mi_setglobal) g_chamMode = 1;
-    else g_chamMode = 2;
-    if (g_chamMode == 0 && mi_setint) { setMatInt(mat, "_ZTest", 8); setMatInt(mat, "_ZWrite", 0); setMatInt(mat, "_Cull", 0); }
-    if (mi_set_queue) { int q = 3500; void *a[1] = { &q }; inv(mi_set_queue, mat, a); }
+    if (!chosen) { chosen = fallback; used = fallbackName; mode = 2; }
+    if (!chosen) { g_chamFailed = true; return false; }
+    g_chamShaderUsed = used; g_chamMode = mode;
+    g_chamMat = il2_gc_new(chosen, 0);
+    if (g_chamMode == 0 && mi_setint) { setMatInt(chosen, "_ZTest", 8); setMatInt(chosen, "_ZWrite", 0); setMatInt(chosen, "_Cull", 0); }
+    if (mi_set_queue) { int q = 3500; void *a[1] = { &q }; inv(mi_set_queue, chosen, a); }
     updateChamColor();
+    NSLog(@"[SCESP] chams shader=%s mode=%d", used, mode);
     return true;
 }
 // UI/Default reads its ZTest from the global unity_GUIZTestMode; keep it on "Always" while chams are live
@@ -563,6 +622,31 @@ static void applyCham(void *rend) {
     if (inv(mi_set_smats, rend, a) == nullptr && false) return;
     g_chams.push_back({ il2_gc_new(rend, 0), il2_gc_new(orig, 0) });
 }
+// The game replaces sharedMaterials itself (hit flash, state change). Our entry would stay in g_chams
+// while the cham is already gone -> check the live array and put our material back.
+static void verifyChams() {
+    void *mat = il2_gc_get(g_chamMat);
+    if (!mat) return;
+    for (auto &c : g_chams) {
+        void *r = il2_gc_get(c.rend);
+        if (!r || !alive(r)) continue;
+        void *cur = inv(mi_get_smats, r, nullptr);
+        if (!cur) continue;
+        uintptr_t n = *(uintptr_t *)((char *)cur + 24);
+        if (n == 0 || n > 16) continue;
+        void **el = (void **)((char *)cur + 32);
+        bool ok = true;
+        for (uintptr_t i = 0; i < n; i++) if (el[i] != mat) { ok = false; break; }
+        if (ok) continue;
+        void *arr = il2_array_new(k_material, n);
+        if (!arr) continue;
+        void **ne = (void **)((char *)arr + 32);
+        for (uintptr_t i = 0; i < n; i++) ne[i] = mat;
+        void *a[1] = { arr };
+        inv(mi_set_smats, r, a);
+        g_chamReapply++;
+    }
+}
 // `want` = renderers that should carry chams right now (enemy SMRs); empty = restore everything
 static void reconcileChams(const std::vector<void *> &want) {
     for (size_t i = 0; i < g_chams.size();) {
@@ -591,7 +675,7 @@ static void reconcileChams(const std::vector<void *> &want) {
     UIView *_panel;
     UILabel *_status;
     UILabel *_lwLabel, *_hdLabel;
-    int _frame;
+    int _frame, _vfy;
     double _lastTick, _lastScan;
 }
 
@@ -812,7 +896,10 @@ static void reconcileChams(const std::vector<void *> &want) {
                     for (size_t b = 0; b < nb; b++) {
                         void *bt = pi.bone[b] ? il2_gc_get(pi.bone[b]) : nullptr;
                         if (!alive(bt)) continue;
+                        if (b < pi.skip.size() && pi.skip[b]) continue;
                         V3 w = d_pos(bt, mi_pos);
+                        { float ex = w.x - p.pos.x, ey = w.y - p.pos.y, ez = w.z - p.pos.z;
+                          if (ey < -kBelowFeet || ey > g_set.head + 0.8f || ex * ex + ez * ez > kMaxReach * kMaxReach) continue; }
                         V3 s = d_world2screen(cam, w, mi_w2s);
                         if (s.z <= 0) continue;
                         CGFloat x = s.x / sw * vs.width, y = (1.0 - s.y / sh) * vs.height;
@@ -854,11 +941,15 @@ static void reconcileChams(const std::vector<void *> &want) {
         } @catch (...) {}
     }
 
-    if (scanNow || g_dirty) {
+    {
+        bool wantOcc = g_set.on && g_set.noocc && (g_set.chams || g_set.skel);
         @try {
-            bool wantOcc = g_set.on && g_set.noocc && (g_set.chams || g_set.skel);
-            if (wantOcc) { setOcclusion(true); forceVisible(); }
-            else if (g_occOff) setOcclusion(false);
+            if (scanNow || g_dirty) {
+                if (wantOcc) { setOcclusion(true); forceVisible(true); }
+                else if (g_occOff) setOcclusion(false);
+            } else if (wantOcc && g_occOff) {
+                forceVisible(false);    // every tick: the game flips renderers back off on hit / state change
+            }
         } @catch (...) {}
     }
 
@@ -870,6 +961,7 @@ static void reconcileChams(const std::vector<void *> &want) {
         } @catch (...) {}
         g_dirty = false;
     }
+    @try { if (g_set.on && g_set.chams && !g_chams.empty() && (++_vfy % 6 == 0)) verifyChams(); } @catch (...) {}
     @try { pumpChamZTest(); } @catch (...) {}
 
     [CATransaction begin];
@@ -886,9 +978,9 @@ static void reconcileChams(const std::vector<void *> &want) {
         NSMutableString *cs = [NSMutableString string];
         for (int i = 0; i < kN; i++) [cs appendFormat:@"%s%zu", i ? "/" : "", g_counts[i]];
         NSString *sh = g_chamShaderUsed ? [NSString stringWithUTF8String:g_chamShaderUsed] : (g_chamFailed ? @"no shader" : @"-");
-        _status.text = [NSString stringWithFormat:@"found %@ | team f%d me%d | draw %d | cam %@\nchams: %@ | %s | %zu on | occ %s(%zu)",
+        _status.text = [NSString stringWithFormat:@"found %@ | team f%d me%d | draw %d | cam %@\nchams: %@ | %s | %zu on re%d | occ %s(%zu)",
                         cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", sh,
-                        g_chamMode == 2 ? "NO x-ray" : "x-ray", g_chams.size(),
+                        g_chamMode == 2 ? "NO x-ray" : "x-ray", g_chams.size(), g_chamReapply,
                         g_occOff ? "off" : "on", g_occ.size()];
     }
 }
