@@ -35,7 +35,7 @@ static const char *kChamShaders[] = { "Hidden/Internal-Colored", "UI/Default", "
 
 // ---- settings --------------------------------------------------------------------------
 struct Settings {
-    bool on = true, box = true, skel = true, chams = false, fill = false, team = false, lowcpu = false;
+    bool on = true, box = true, skel = true, chams = false, fill = false, team = false, lowcpu = false, noocc = true;
     int color = 0;
     float lw = 1.5f;
     float head = 1.8f;
@@ -60,6 +60,7 @@ static void saveSettings() {
     [d setBool:g_set.skel forKey:@"scesp_skel"];   [d setBool:g_set.chams forKey:@"scesp_chams"];
     [d setBool:g_set.fill forKey:@"scesp_fill"];   [d setBool:g_set.team forKey:@"scesp_team"];
     [d setBool:g_set.lowcpu forKey:@"scesp_low"];
+    [d setBool:g_set.noocc forKey:@"scesp_noocc"];
     [d setInteger:g_set.color forKey:@"scesp_color"];
     [d setFloat:g_set.lw forKey:@"scesp_lw"];      [d setFloat:g_set.head forKey:@"scesp_head"];
 }
@@ -70,6 +71,7 @@ static void loadSettings() {
     g_set.skel = [d boolForKey:@"scesp_skel"];     g_set.chams = [d boolForKey:@"scesp_chams"];
     g_set.fill = [d boolForKey:@"scesp_fill"];     g_set.team = [d boolForKey:@"scesp_team"];
     g_set.lowcpu = [d boolForKey:@"scesp_low"];
+    g_set.noocc = [d objectForKey:@"scesp_noocc"] ? [d boolForKey:@"scesp_noocc"] : true;
     g_set.color = (int)[d integerForKey:@"scesp_color"];
     g_set.lw = [d floatForKey:@"scesp_lw"];        g_set.head = [d floatForKey:@"scesp_head"];
     if (g_set.lw < 0.5f) g_set.lw = 1.5f;
@@ -217,6 +219,8 @@ static int g_teamField = -1;
 static void *k_smr, *k_material, *k_shader;
 static void *mi_find, *mi_get_bones, *mi_get_smats, *mi_set_smats, *mi_find_shader, *mi_mat_ctor;
 static void *mi_set_color, *mi_set_queue, *mi_setint, *mi_setglobal;
+static void *k_animator, *k_occsys;
+static void *mi_anim_cull, *mi_beh_enabled, *mi_smr_offscreen, *mi_rend_enabled, *mi_cam_occ;
 
 static d_get_main d_cam_main;  static void *mi_cam_main;
 static d_obj_get d_tr;         static void *mi_tr;
@@ -265,6 +269,19 @@ static bool resolveAll() {
 
     // skeleton / chams helpers (all optional: missing ones just disable that feature)
     if (k_smr)  mi_get_bones = il2_get_method(k_smr, "get_bones", 0);
+    {   // occlusion / animation-culling overrides (optional)
+        void *cBeh = il2_class_from_name(core, "UnityEngine", "Behaviour");
+        if (cBeh) mi_beh_enabled = il2_get_method(cBeh, "set_enabled", 1);
+        if (cRend) mi_rend_enabled = il2_get_method(cRend, "set_enabled", 1);
+        if (k_smr) mi_smr_offscreen = il2_get_method(k_smr, "set_updateWhenOffscreen", 1);
+        mi_cam_occ = il2_get_method(cCamera, "set_useOcclusionCulling", 1);
+        void *animImg = findImage("UnityEngine.AnimationModule.dll");
+        if (animImg) {
+            k_animator = il2_class_from_name(animImg, "UnityEngine", "Animator");
+            if (k_animator) mi_anim_cull = il2_get_method(k_animator, "set_cullingMode", 1);
+        }
+        k_occsys = il2_class_from_name(game, "Chillow.StandChillow.Occlusion.Dynamic", "OcclusionSystem");
+    }
     if (cRend) {
         mi_get_smats = il2_get_method(cRend, "get_sharedMaterials", 0);
         mi_set_smats = il2_get_method(cRend, "set_sharedMaterials", 1);
@@ -310,6 +327,7 @@ static inline int readTeam(void *obj, int field) {
 struct PlayerInfo {
     uint32_t obj = 0;
     std::vector<uint32_t> smr;      // SkinnedMeshRenderer handles belonging to this player
+    std::vector<uint32_t> anim;     // Animator handles belonging to this player
     std::vector<uint32_t> bone;     // Transform handles (biggest SMR's bones)
     std::vector<int> parent;        // parent index inside `bone`, or -1
 };
@@ -318,6 +336,7 @@ static std::vector<PlayerInfo> g_pl;
 static void freeInfo(PlayerInfo &p) {
     if (p.obj) il2_gc_free(p.obj);
     for (uint32_t h : p.smr) il2_gc_free(h);
+    for (uint32_t h : p.anim) il2_gc_free(h);
     for (uint32_t h : p.bone) il2_gc_free(h);
 }
 
@@ -363,17 +382,23 @@ static void rescan(bool wantBones) {
                 tr = d_parent(tr, mi_parent);
             }
         }
+        auto ownerOf = [&](void *comp) -> int {
+            void *tr = d_tr(comp, mi_tr);
+            for (int depth = 0; depth < 20 && tr; depth++) {
+                for (auto &a : anc) if (a.tr == tr && a.cnt == 1) return a.pl;
+                tr = d_parent(tr, mi_parent);
+            }
+            return -1;
+        };
         std::vector<void *> smrs;
         findObjs(k_smr, smrs, 512);
         std::vector<std::vector<void *>> mine(objs.size());
-        for (void *smr : smrs) {
-            void *tr = d_tr(smr, mi_tr);
-            int owner = -1;
-            for (int depth = 0; depth < 20 && tr && owner < 0; depth++) {
-                for (auto &a : anc) if (a.tr == tr && a.cnt == 1) { owner = a.pl; break; }
-                tr = d_parent(tr, mi_parent);
-            }
-            if (owner >= 0) mine[owner].push_back(smr);
+        for (void *smr : smrs) { int o = ownerOf(smr); if (o >= 0) mine[o].push_back(smr); }
+        std::vector<std::vector<void *>> animsOf(objs.size());
+        if (k_animator) {
+            std::vector<void *> anims;
+            findObjs(k_animator, anims, 512);
+            for (void *an : anims) { int o = ownerOf(an); if (o >= 0) animsOf[o].push_back(an); }
         }
         for (size_t i = 0; i < objs.size(); i++) {
             void *best = nullptr; uintptr_t bestN = 0;
@@ -383,6 +408,7 @@ static void rescan(bool wantBones) {
                 uintptr_t n = arr ? *(uintptr_t *)((char *)arr + 24) : 0;
                 if (n > bestN) { bestN = n; best = arr; }
             }
+            for (void *an : animsOf[i]) fresh[i].anim.push_back(il2_gc_new(an, 0));
             if (!best) continue;
             if (bestN > 160) bestN = 160;
             void **bones = (void **)((char *)best + 32);
@@ -400,6 +426,50 @@ static void rescan(bool wantBones) {
     }
     for (auto &p : g_pl) freeInfo(p);
     g_pl.swap(fresh);
+}
+
+// ---- occlusion override ----------------------------------------------------------------
+// The game hides occluded characters itself (OcclusionSystem -> ObjectOccludee), and animators of
+// hidden models stop updating (that is the T-pose). Turn that system off while skeleton/chams are on.
+static std::vector<uint32_t> g_occ;
+static bool g_occOff = false;
+
+static void setOcclusion(bool disabled) {
+    for (uint32_t h : g_occ) il2_gc_free(h);
+    g_occ.clear();
+    if (k_occsys) {
+        std::vector<void *> o;
+        findObjs(k_occsys, o, 8);
+        for (void *x : o) g_occ.push_back(il2_gc_new(x, 0));
+    }
+    bool en = !disabled;
+    for (uint32_t h : g_occ) {
+        void *x = il2_gc_get(h);
+        if (alive(x)) { void *a[1] = { &en }; inv(mi_beh_enabled, x, a); }
+    }
+    void *cam = d_cam_main(mi_cam_main);
+    if (cam && alive(cam)) { bool u = !disabled; void *a[1] = { &u }; inv(mi_cam_occ, cam, a); }
+    g_occOff = disabled;
+}
+
+static void forceVisible() {
+    for (auto &p : g_pl) {
+        for (uint32_t h : p.smr) {
+            void *r = il2_gc_get(h);
+            if (!alive(r)) continue;
+            bool t = true; void *a[1] = { &t };
+            inv(mi_rend_enabled, r, a);
+            inv(mi_smr_offscreen, r, a);
+        }
+        for (uint32_t h : p.anim) {
+            void *an = il2_gc_get(h);
+            if (!alive(an)) continue;
+            int mode = 0; void *a1[1] = { &mode };      // AnimatorCullingMode.AlwaysAnimate
+            inv(mi_anim_cull, an, a1);
+            bool t = true; void *a2[1] = { &t };
+            inv(mi_beh_enabled, an, a2);
+        }
+    }
 }
 
 // ---- chams -----------------------------------------------------------------------------
@@ -554,6 +624,7 @@ static void reconcileChams(const std::vector<void *> &want) {
     [self addSwitch:@"Box fill" col:0 row:2 tag:4 on:g_set.fill];
     [self addSwitch:@"Teammates" col:1 row:2 tag:5 on:g_set.team];
     [self addSwitch:@"Low CPU" col:0 row:3 tag:6 on:g_set.lowcpu];
+    [self addSwitch:@"No occlusion" col:1 row:3 tag:7 on:g_set.noocc];
 
     UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"R", @"G", @"C", @"Y", @"W", @"M", @"O"]];
     seg.frame = CGRectMake(10, 148, 310, 26);
@@ -613,6 +684,7 @@ static void reconcileChams(const std::vector<void *> &want) {
         case 4: g_set.fill = s.on; break;
         case 5: g_set.team = s.on; break;
         case 6: g_set.lowcpu = s.on; break;
+        case 7: g_set.noocc = s.on; break;
     }
     g_dirty = true; saveSettings();
 }
@@ -765,6 +837,14 @@ static void reconcileChams(const std::vector<void *> &want) {
         } @catch (...) {}
     }
 
+    if (scanNow || g_dirty) {
+        @try {
+            bool wantOcc = g_set.on && g_set.noocc && (g_set.chams || g_set.skel);
+            if (wantOcc) { setOcclusion(true); forceVisible(); }
+            else if (g_occOff) setOcclusion(false);
+        } @catch (...) {}
+    }
+
     if (g_dirty || scanNow || !g_set.on) {
         @try {
             if (!g_set.on || !g_set.chams) wantChams.clear();
@@ -789,9 +869,10 @@ static void reconcileChams(const std::vector<void *> &want) {
         NSMutableString *cs = [NSMutableString string];
         for (int i = 0; i < kN; i++) [cs appendFormat:@"%s%zu", i ? "/" : "", g_counts[i]];
         NSString *sh = g_chamShaderUsed ? [NSString stringWithUTF8String:g_chamShaderUsed] : (g_chamFailed ? @"no shader" : @"-");
-        _status.text = [NSString stringWithFormat:@"found %@ | team f%d me%d | draw %d | cam %@\nchams: %@ | %s | %zu on",
+        _status.text = [NSString stringWithFormat:@"found %@ | team f%d me%d | draw %d | cam %@\nchams: %@ | %s | %zu on | occ %s(%zu)",
                         cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", sh,
-                        g_chamMode == 2 ? "NO x-ray" : "x-ray", g_chams.size()];
+                        g_chamMode == 2 ? "NO x-ray" : "x-ray", g_chams.size(),
+                        g_occOff ? "off" : "on", g_occ.size()];
     }
 }
 @end
