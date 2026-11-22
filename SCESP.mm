@@ -328,6 +328,7 @@ struct PlayerInfo {
     uint32_t obj = 0;
     std::vector<uint32_t> smr;      // SkinnedMeshRenderer handles belonging to this player
     std::vector<uint32_t> anim;     // Animator handles belonging to this player
+    uint32_t body = 0;              // the SMR with the most bones = third-person body (not FP arms)
     std::vector<uint32_t> bone;     // Transform handles (biggest SMR's bones)
     std::vector<int> parent;        // parent index inside `bone`, or -1
 };
@@ -337,6 +338,7 @@ static void freeInfo(PlayerInfo &p) {
     if (p.obj) il2_gc_free(p.obj);
     for (uint32_t h : p.smr) il2_gc_free(h);
     for (uint32_t h : p.anim) il2_gc_free(h);
+    if (p.body) il2_gc_free(p.body);
     for (uint32_t h : p.bone) il2_gc_free(h);
 }
 
@@ -401,14 +403,15 @@ static void rescan(bool wantBones) {
             for (void *an : anims) { int o = ownerOf(an); if (o >= 0) animsOf[o].push_back(an); }
         }
         for (size_t i = 0; i < objs.size(); i++) {
-            void *best = nullptr; uintptr_t bestN = 0;
+            void *best = nullptr, *bestSmr = nullptr; uintptr_t bestN = 0;
             for (void *smr : mine[i]) {
                 fresh[i].smr.push_back(il2_gc_new(smr, 0));
                 void *arr = inv(mi_get_bones, smr, nullptr);
                 uintptr_t n = arr ? *(uintptr_t *)((char *)arr + 24) : 0;
-                if (n > bestN) { bestN = n; best = arr; }
+                if (n > bestN) { bestN = n; best = arr; bestSmr = smr; }
             }
             for (void *an : animsOf[i]) fresh[i].anim.push_back(il2_gc_new(an, 0));
+            if (bestSmr) fresh[i].body = il2_gc_new(bestSmr, 0);
             if (!best) continue;
             if (bestN > 160) bestN = 160;
             void **bones = (void **)((char *)best + 32);
@@ -453,21 +456,34 @@ static void setOcclusion(bool disabled) {
 }
 
 static void forceVisible() {
+    // Only enemy bodies: never "me" (the camera's own third-person body must stay hidden) and
+    // never the first-person arms meshes (they float in the air if switched on).
+    void *cam = d_cam_main(mi_cam_main);
+    bool haveCam = false; V3 cp = { 0, 0, 0 };
+    if (cam && alive(cam)) { void *ct = d_tr(cam, mi_tr); if (ct) { cp = d_pos(ct, mi_pos); haveCam = true; } }
     for (auto &p : g_pl) {
-        for (uint32_t h : p.smr) {
-            void *r = il2_gc_get(h);
-            if (!alive(r)) continue;
-            bool t = true; void *a[1] = { &t };
-            inv(mi_rend_enabled, r, a);
-            inv(mi_smr_offscreen, r, a);
+        void *po = il2_gc_get(p.obj);
+        if (!alive(po)) continue;
+        if (haveCam) {
+            void *tr = d_tr(po, mi_tr);
+            if (!tr) continue;
+            V3 q = d_pos(tr, mi_pos);
+            float dx = q.x - cp.x, dz = q.z - cp.z;
+            if (dx * dx + dz * dz < kSelfRadius * kSelfRadius * 4) continue;      // me
+        } else continue;
+        if (p.body) {
+            void *r = il2_gc_get(p.body);
+            if (alive(r)) {
+                bool t = true; void *a[1] = { &t };
+                inv(mi_rend_enabled, r, a);
+                inv(mi_smr_offscreen, r, a);
+            }
         }
         for (uint32_t h : p.anim) {
             void *an = il2_gc_get(h);
             if (!alive(an)) continue;
             int mode = 0; void *a1[1] = { &mode };      // AnimatorCullingMode.AlwaysAnimate
             inv(mi_anim_cull, an, a1);
-            bool t = true; void *a2[1] = { &t };
-            inv(mi_beh_enabled, an, a2);
         }
     }
 }
@@ -786,7 +802,8 @@ static void reconcileChams(const std::vector<void *> &want) {
                         if (!g_set.team && (myTeam == 1 || myTeam == 2) && tv == myTeam) continue;
                     }
                     PlayerInfo &pi = *p.pi;
-                    for (uint32_t h : pi.smr) { void *r = il2_gc_get(h); if (r) wantChams.push_back(r); }
+                    if (pi.body) { void *r = il2_gc_get(pi.body); if (r) wantChams.push_back(r); }
+                    else for (uint32_t h : pi.smr) { void *r = il2_gc_get(h); if (r) wantChams.push_back(r); }
 
                     size_t nb = pi.bone.size();
                     sp.assign(nb, CGPointMake(0, 0)); okp.assign(nb, 0);
