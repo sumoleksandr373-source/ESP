@@ -1289,6 +1289,10 @@ static NSString *diagRenderer(void *r) {
 // ---- UI --------------------------------------------------------------------------------
 // ---- Neverlose-style UI kit ---------------------------------------------------------------
 static UIColor *nlRGB(int r, int g, int b, CGFloat a = 1.0) { return [UIColor colorWithRed:r / 255.f green:g / 255.f blue:b / 255.f alpha:a]; }
+static inline CGFloat nlMinX(CGRect r) { return r.origin.x; }
+static inline CGFloat nlMaxX(CGRect r) { return r.origin.x + r.size.width; }
+static inline CGFloat nlMaxY(CGRect r) { return r.origin.y + r.size.height; }
+static inline CGFloat nlMidY(CGRect r) { return r.origin.y + r.size.height * 0.5; }   // no CoreGraphics link needed
 #define NL_ACCENT nlRGB(61, 166, 255)
 #define NL_WIN    nlRGB(10, 14, 22)
 #define NL_SIDE   nlRGB(7, 10, 16)
@@ -1322,7 +1326,7 @@ static UIColor *nlRGB(int r, int g, int b, CGFloat a = 1.0) { return [UIColor co
 - (void)setOn:(BOOL)on { _on = on; [self paint:NO]; }
 - (void)paint:(BOOL)anim {
     CGRect t = _track.frame;
-    CGPoint c = CGPointMake(_on ? CGRectGetMaxX(t) - 8 : CGRectGetMinX(t) + 8, CGRectGetMidY(t));
+    CGPoint c = CGPointMake(_on ? nlMaxX(t) - 8 : nlMinX(t) + 8, nlMidY(t));
     [CATransaction begin];
     [CATransaction setDisableActions:!anim];
     [CATransaction setAnimationDuration:0.14];
@@ -1523,7 +1527,7 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
         nlButton(b, @"Learn look fields", self, @selector(learnTapped));
         _aimInfo = nlInfo(b, 72, 9);
         nlEnd(b);
-        pg.contentSize = CGSizeMake(PW, fmax(CGRectGetMaxY(a.v.frame), CGRectGetMaxY(b.v.frame)) + 8);
+        pg.contentSize = CGSizeMake(PW, fmax(nlMaxY(a.v.frame), nlMaxY(b.v.frame)) + 8);
     }
     // --- Visuals ---
     {
@@ -1543,10 +1547,10 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
         _lwLabel = nlSlider(b, @"Line width", 10, 0.5, 4, g_set.lw, self, @selector(slChanged:));
         _hdLabel = nlSlider(b, @"Box height", 11, 1.4, 2.2, g_set.head, self, @selector(slChanged:));
         nlEnd(b);
-        NLCard c = nlCard(pg, @"Health", CW + 8, CGRectGetMaxY(b.v.frame) + 8, CW);
+        NLCard c = nlCard(pg, @"Health", CW + 8, nlMaxY(b.v.frame) + 8, CW);
         _hpBtn = nlButton(c, @"Learn health", self, @selector(hpLearnTapped));
         nlEnd(c);
-        pg.contentSize = CGSizeMake(PW, fmax(CGRectGetMaxY(a.v.frame), CGRectGetMaxY(c.v.frame)) + 8);
+        pg.contentSize = CGSizeMake(PW, fmax(nlMaxY(a.v.frame), nlMaxY(c.v.frame)) + 8);
     }
     // --- Misc ---
     {
@@ -1555,11 +1559,11 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
         nlToggle(a, @"Low CPU", 6, g_set.lowcpu, self, @selector(swChanged:));
         nlToggle(a, @"No occlusion", 7, g_set.noocc, self, @selector(swChanged:));
         nlEnd(a);
-        NLCard st = nlCard(pg, @"Status", 0, CGRectGetMaxY(a.v.frame) + 8, PW);
+        NLCard st = nlCard(pg, @"Status", 0, nlMaxY(a.v.frame) + 8, PW);
         _status = nlInfo(st, 84, 8.5);
         _status.textColor = nlRGB(150, 165, 190);
         nlEnd(st);
-        pg.contentSize = CGSizeMake(PW, CGRectGetMaxY(st.v.frame) + 8);
+        pg.contentSize = CGSizeMake(PW, nlMaxY(st.v.frame) + 8);
     }
     [self selectTab:0];
     [self refreshLabels];
