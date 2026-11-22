@@ -53,6 +53,8 @@ struct Settings {
     float lw = 1.5f;
     float head = 1.8f;
     float fov = 45.0f;      // aim capture cone, degrees
+    float aimSpeed = 14.0f; // aim smoothing: higher = snappier (1/s)
+    bool drawFov = true;    // draw the aim capture outline on screen
 };
 static Settings g_set;
 static bool g_dirty = true;
@@ -80,6 +82,8 @@ static void saveSettings() {
     [d setInteger:g_set.color forKey:@"scesp_color"];
     [d setFloat:g_set.lw forKey:@"scesp_lw"];      [d setFloat:g_set.head forKey:@"scesp_head"];
     [d setFloat:g_set.fov forKey:@"scesp_fov"];
+    [d setFloat:g_set.aimSpeed forKey:@"scesp_aspd"];
+    [d setBool:g_set.drawFov forKey:@"scesp_dfov"];
 }
 static void loadSettings() {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -96,6 +100,8 @@ static void loadSettings() {
     if (g_set.lw < 0.5f) g_set.lw = 1.5f;
     if (g_set.head < 1.0f) g_set.head = 1.8f;
     g_set.fov = [d floatForKey:@"scesp_fov"]; if (g_set.fov < 5.0f) g_set.fov = 45.0f;
+    g_set.aimSpeed = [d floatForKey:@"scesp_aspd"]; if (g_set.aimSpeed < 2.0f) g_set.aimSpeed = 14.0f;
+    g_set.drawFov = [d objectForKey:@"scesp_dfov"] ? [d boolForKey:@"scesp_dfov"] : true;
 }
 
 // ---- il2cpp API ------------------------------------------------------------------------
@@ -646,14 +652,18 @@ static void probeStep(void *me, void *aim, float cy, float cp, double now) {
     g_probePhase = 0;
 }
 static double g_aimLastW = 0;
-static float g_aimLwY = 0, g_aimLwP = 0;
-static void aimStep(void *me, void *aim, float dyaw, float dpit) {
+struct AimTg { V3 pos; void *id; };
+static void *g_lockId = nullptr;         // target we are currently locked on (sticky, so we do not flick between bots)
+// Runs on EVERY tick with the real elapsed time: first-order approach to the target, so the motion does not depend
+// on the tick rate (the run loop can wake several times per frame). Small cap on the angular speed = no snapping.
+static void aimStep(void *me, void *aim, float dyaw, float dpit, float dt) {
     float *py = candAddr(g_yawC, me, aim), *pp = candAddr(g_pitC, me, aim);
-    dyaw = fmaxf(-8.f, fminf(8.f, dyaw)); dpit = fmaxf(-8.f, fminf(8.f, dpit));
-    if (fabsf(dyaw) < 0.12f) dyaw = 0;
-    if (fabsf(dpit) < 0.12f) dpit = 0;
-    if (py) *py += g_yawK * dyaw * 0.35f;
-    if (pp) *pp += g_pitK * dpit * 0.35f;
+    float s = 1.f - expf(-dt * g_set.aimSpeed);
+    float cap = 320.f * dt;                                   // max degrees per tick (~320 deg/s)
+    dyaw = fmaxf(-cap, fminf(cap, dyaw * s));
+    dpit = fmaxf(-cap, fminf(cap, dpit * s));
+    if (py) *py += g_yawK * dyaw;
+    if (pp) *pp += g_pitK * dpit;
 }
 
 // ---- scene scan ------------------------------------------------------------------------
@@ -1277,6 +1287,124 @@ static NSString *diagRenderer(void *r) {
 }
 
 // ---- UI --------------------------------------------------------------------------------
+// ---- Neverlose-style UI kit ---------------------------------------------------------------
+static UIColor *nlRGB(int r, int g, int b, CGFloat a = 1.0) { return [UIColor colorWithRed:r / 255.f green:g / 255.f blue:b / 255.f alpha:a]; }
+#define NL_ACCENT nlRGB(61, 166, 255)
+#define NL_WIN    nlRGB(10, 14, 22)
+#define NL_SIDE   nlRGB(7, 10, 16)
+#define NL_CARD   nlRGB(16, 23, 36)
+#define NL_BORDER nlRGB(28, 38, 58)
+#define NL_TEXT   nlRGB(201, 211, 227)
+#define NL_DIM    nlRGB(107, 122, 147)
+#define NL_OFF    nlRGB(30, 40, 58)
+
+@interface NLToggle : UIControl
+@property (nonatomic, assign) BOOL on;
+- (instancetype)initWithFrame:(CGRect)f title:(NSString *)title;
+@end
+@implementation NLToggle {
+    CALayer *_track, *_knob;
+}
+- (instancetype)initWithFrame:(CGRect)f title:(NSString *)title {
+    if ((self = [super initWithFrame:f])) {
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, f.size.width - 56, f.size.height)];
+        l.text = title; l.textColor = NL_TEXT; l.font = [UIFont systemFontOfSize:11]; l.userInteractionEnabled = NO;
+        [self addSubview:l];
+        _track = [CALayer layer]; _track.frame = CGRectMake(f.size.width - 40, (f.size.height - 16) / 2, 30, 16); _track.cornerRadius = 8;
+        _knob = [CALayer layer]; _knob.bounds = CGRectMake(0, 0, 12, 12); _knob.cornerRadius = 6; _knob.backgroundColor = UIColor.whiteColor.CGColor;
+        [self.layer addSublayer:_track]; [self.layer addSublayer:_knob];
+        [self addTarget:self action:@selector(flip) forControlEvents:UIControlEventTouchUpInside];
+        [self paint:NO];
+    }
+    return self;
+}
+- (void)flip { _on = !_on; [self paint:YES]; [self sendActionsForControlEvents:UIControlEventValueChanged]; }
+- (void)setOn:(BOOL)on { _on = on; [self paint:NO]; }
+- (void)paint:(BOOL)anim {
+    CGRect t = _track.frame;
+    CGPoint c = CGPointMake(_on ? CGRectGetMaxX(t) - 8 : CGRectGetMinX(t) + 8, CGRectGetMidY(t));
+    [CATransaction begin];
+    [CATransaction setDisableActions:!anim];
+    [CATransaction setAnimationDuration:0.14];
+    _track.backgroundColor = (_on ? NL_ACCENT : NL_OFF).CGColor;
+    _knob.position = c;
+    [CATransaction commit];
+}
+@end
+
+struct NLCard { __unsafe_unretained UIView *v; CGFloat y, w; };
+static NLCard nlCard(UIView *parent, NSString *title, CGFloat x, CGFloat y, CGFloat w) {
+    UIView *c = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, 30)];
+    c.backgroundColor = NL_CARD; c.layer.cornerRadius = 8; c.layer.borderWidth = 1; c.layer.borderColor = NL_BORDER.CGColor;
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(10, 8, w - 20, 12)];
+    t.attributedText = [[NSAttributedString alloc] initWithString:title.uppercaseString attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:9 weight:UIFontWeightBold], NSForegroundColorAttributeName: NL_DIM, NSKernAttributeName: @1.2 }];
+    [c addSubview:t]; [parent addSubview:c];
+    NLCard k; k.v = c; k.y = 28; k.w = w;
+    return k;
+}
+static void nlEnd(NLCard &k) { CGRect f = k.v.frame; f.size.height = k.y + 6; k.v.frame = f; }
+static void nlToggle(NLCard &k, NSString *title, int tag, BOOL on, id tgt, SEL sel) {
+    NLToggle *t = [[NLToggle alloc] initWithFrame:CGRectMake(0, k.y, k.w, 24) title:title];
+    t.tag = tag; t.on = on;
+    [t addTarget:tgt action:sel forControlEvents:UIControlEventValueChanged];
+    [k.v addSubview:t]; k.y += 24;
+}
+static UIImage *nlThumb() {
+    static UIImage *img;
+    if (!img) {
+        UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(12, 12)];
+        img = [r imageWithActions:^(UIGraphicsImageRendererContext *c) { [UIColor.whiteColor setFill]; [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(0, 0, 12, 12)] fill]; }];
+    }
+    return img;
+}
+// returns the value label so the caller can keep it up to date
+static UILabel *nlSlider(NLCard &k, NSString *title, int tag, float mn, float mx, float val, id tgt, SEL sel) {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, k.y, k.w - 64, 14)];
+    l.text = title; l.textColor = NL_TEXT; l.font = [UIFont systemFontOfSize:11];
+    UILabel *v = [[UILabel alloc] initWithFrame:CGRectMake(k.w - 56, k.y, 46, 14)];
+    v.textColor = NL_ACCENT; v.font = [UIFont monospacedDigitSystemFontOfSize:10 weight:UIFontWeightSemibold]; v.textAlignment = NSTextAlignmentRight;
+    UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(6, k.y + 14, k.w - 12, 20)];
+    sl.minimumValue = mn; sl.maximumValue = mx; sl.value = val; sl.tag = tag;
+    sl.minimumTrackTintColor = NL_ACCENT; sl.maximumTrackTintColor = NL_OFF;
+    [sl setThumbImage:nlThumb() forState:UIControlStateNormal]; [sl setThumbImage:nlThumb() forState:UIControlStateHighlighted];
+    [sl addTarget:tgt action:sel forControlEvents:UIControlEventValueChanged];
+    [k.v addSubview:l]; [k.v addSubview:v]; [k.v addSubview:sl];
+    k.y += 38;
+    return v;
+}
+static UIButton *nlButton(NLCard &k, NSString *title, id tgt, SEL sel) {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = CGRectMake(10, k.y, k.w - 20, 24);
+    b.backgroundColor = nlRGB(24, 34, 52); b.layer.cornerRadius = 6; b.layer.borderWidth = 1; b.layer.borderColor = NL_BORDER.CGColor;
+    b.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    [b setTitle:title forState:UIControlStateNormal];
+    [b setTitleColor:NL_ACCENT forState:UIControlStateNormal];
+    [b setTitleColor:NL_DIM forState:UIControlStateHighlighted];
+    [b addTarget:tgt action:sel forControlEvents:UIControlEventTouchUpInside];
+    [k.v addSubview:b]; k.y += 30;
+    return b;
+}
+static UILabel *nlInfo(NLCard &k, CGFloat h, CGFloat font) {
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, k.y, k.w - 20, h)];
+    l.numberOfLines = 0; l.textColor = NL_DIM; l.font = [UIFont monospacedSystemFontOfSize:font weight:UIFontWeightRegular];
+    l.lineBreakMode = NSLineBreakByWordWrapping;
+    [k.v addSubview:l]; k.y += h + 4;
+    return l;
+}
+static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out) {
+    CGFloat step = (k.w - 20) / 7.0;
+    for (int i = 0; i < 7; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.frame = CGRectMake(10 + i * step + (step - 20) / 2, k.y, 20, 20);
+        b.backgroundColor = colorFor(i, 1); b.layer.cornerRadius = 10; b.tag = i;
+        b.layer.borderWidth = (i == sel) ? 2 : 0; b.layer.borderColor = UIColor.whiteColor.CGColor;
+        [b addTarget:tgt action:act forControlEvents:UIControlEventTouchUpInside];
+        [k.v addSubview:b]; [out addObject:b];
+    }
+    k.y += 28;
+}
+
 @interface SCESPDriver : NSObject
 - (void)tick;
 @end
@@ -1288,7 +1416,9 @@ static NSString *diagRenderer(void *r) {
     UIButton *_btn, *_hpBtn;
     UIView *_panel;
     UILabel *_status;
-    UILabel *_lwLabel, *_hdLabel, *_fovLabel;
+    UILabel *_lwLabel, *_hdLabel, *_fovLabel, *_spdLabel, *_aimInfo, *_tabTitle;
+    CAShapeLayer *_fovRing;
+    NSMutableArray *_pages, *_tabs, *_swatches;
     int _frame, _vfy;
     void *_diagR;
     double _lastTick, _lastScan;
@@ -1316,100 +1446,142 @@ static NSString *diagRenderer(void *r) {
 }
 
 - (void)buildPanel {
-    _panel = [[UIView alloc] initWithFrame:CGRectMake(8, 72, 330, 338)];
-    _panel.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
-    _panel.layer.cornerRadius = 10;
+    const CGFloat W = 470, H = 300, SB = 88;
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(8, 72, W, H)];
+    _panel.backgroundColor = [NL_WIN colorWithAlphaComponent:0.97];
+    _panel.layer.cornerRadius = 12; _panel.layer.borderWidth = 1; _panel.layer.borderColor = NL_BORDER.CGColor;
+    _panel.clipsToBounds = YES;
     _panel.hidden = YES;
+    _pages = [NSMutableArray array]; _tabs = [NSMutableArray array]; _swatches = [NSMutableArray array];
 
-    UILabel *hd = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 330, 26)];
-    hd.text = @"  \u2630  ESP settings  (drag here to move)";
-    hd.textColor = UIColor.whiteColor; hd.font = [UIFont boldSystemFontOfSize:12];
-    hd.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
-    hd.userInteractionEnabled = YES;
-    hd.layer.cornerRadius = 10; hd.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
-    hd.clipsToBounds = YES;
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panMoved:)];
-    [hd addGestureRecognizer:pan];
-    [_panel addSubview:hd];
+    // sidebar
+    UIView *side = [[UIView alloc] initWithFrame:CGRectMake(0, 0, SB, H)];
+    side.backgroundColor = NL_SIDE;
+    [_panel addSubview:side];
+    UILabel *logo = [[UILabel alloc] initWithFrame:CGRectMake(14, 12, SB - 14, 20)];
+    logo.attributedText = [[NSAttributedString alloc] initWithString:@"SCESP" attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightHeavy], NSForegroundColorAttributeName: NL_ACCENT, NSKernAttributeName: @1.5 }];
+    [side addSubview:logo];
+    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(14, 32, SB - 14, 12)];
+    sub.text = @"offline bots"; sub.textColor = NL_DIM; sub.font = [UIFont systemFontOfSize:9];
+    [side addSubview:sub];
+    UIView *dragA = [[UIView alloc] initWithFrame:CGRectMake(0, 0, SB, 52)];
+    [dragA addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panMoved:)]];
+    [side addSubview:dragA];
+    UIView *vline = [[UIView alloc] initWithFrame:CGRectMake(SB, 0, 1, H)]; vline.backgroundColor = NL_BORDER; [_panel addSubview:vline];
 
-    [self addSwitch:@"ESP" col:0 row:0 tag:0 on:g_set.on];
-    [self addSwitch:@"Box" col:1 row:0 tag:1 on:g_set.box];
-    [self addSwitch:@"Skeleton" col:0 row:1 tag:2 on:g_set.skel];
-    [self addSwitch:@"Chams" col:1 row:1 tag:3 on:g_set.chams];
-    [self addSwitch:@"Box fill" col:0 row:2 tag:4 on:g_set.fill];
-    [self addSwitch:@"Teammates" col:1 row:2 tag:5 on:g_set.team];
-    [self addSwitch:@"Low CPU" col:0 row:3 tag:6 on:g_set.lowcpu];
-    [self addSwitch:@"No occlusion" col:1 row:3 tag:7 on:g_set.noocc];
-    [self addSwitch:@"Head dot" col:0 row:4 tag:12 on:g_set.hdot];
-    _fovLabel = [[UILabel alloc] initWithFrame:CGRectMake(170, 126, 56, 24)];
-    _fovLabel.textColor = UIColor.whiteColor; _fovLabel.font = [UIFont systemFontOfSize:11];
-    [_panel addSubview:_fovLabel];
-    UISlider *s3 = [[UISlider alloc] initWithFrame:CGRectMake(226, 126, 94, 24)];
-    s3.minimumValue = 5; s3.maximumValue = 90; s3.value = g_set.fov; s3.tag = 13;
-    [s3 addTarget:self action:@selector(slChanged:) forControlEvents:UIControlEventValueChanged];
-    [_panel addSubview:s3];
+    // top bar (drag handle + close)
+    UIView *top = [[UIView alloc] initWithFrame:CGRectMake(SB + 1, 0, W - SB - 1, 32)];
+    [top addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panMoved:)]];
+    [_panel addSubview:top];
+    _tabTitle = [[UILabel alloc] initWithFrame:CGRectMake(14, 0, 200, 32)];
+    _tabTitle.textColor = NL_TEXT; _tabTitle.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
+    [top addSubview:_tabTitle];
+    UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(W - SB - 150, 0, 110, 32)];
+    hint.text = @"drag to move"; hint.textColor = NL_DIM; hint.font = [UIFont systemFontOfSize:9]; hint.textAlignment = NSTextAlignmentRight;
+    [top addSubview:hint];
+    UIButton *x = [UIButton buttonWithType:UIButtonTypeCustom];
+    x.frame = CGRectMake(W - SB - 34, 4, 24, 24);
+    [x setTitle:@"\u2715" forState:UIControlStateNormal]; [x setTitleColor:NL_DIM forState:UIControlStateNormal];
+    x.titleLabel.font = [UIFont systemFontOfSize:13];
+    [x addTarget:self action:@selector(plateTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_panel addSubview:x];
+    UIView *hline = [[UIView alloc] initWithFrame:CGRectMake(SB + 1, 32, W - SB - 1, 1)]; hline.backgroundColor = NL_BORDER; [_panel addSubview:hline];
 
-    UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"R", @"G", @"C", @"Y", @"W", @"M", @"O"]];
-    seg.frame = CGRectMake(10, 154, 310, 26);
-    seg.selectedSegmentIndex = g_set.color;
-    [seg addTarget:self action:@selector(segChanged:) forControlEvents:UIControlEventValueChanged];
-    [_panel addSubview:seg];
+    // tabs + pages
+    const CGFloat PX = SB + 9, PY = 40, PW = W - SB - 17, PH = H - PY - 6, CW = (PW - 8) / 2;
+    NSArray *names = @[@"Aimbot", @"Visuals", @"Misc"], *icons = @[@"scope", @"eye", @"slider.horizontal.3"];
+    for (int i = 0; i < 3; i++) {
+        UIButton *tb = [UIButton buttonWithType:UIButtonTypeCustom];
+        tb.frame = CGRectMake(0, 62 + i * 34, SB, 32); tb.tag = i;
+        tb.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+        tb.contentEdgeInsets = UIEdgeInsetsMake(0, 36, 0, 0);
+        tb.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+        [tb setTitle:names[i] forState:UIControlStateNormal];
+        UIImageView *ic = [[UIImageView alloc] initWithFrame:CGRectMake(14, 8, 16, 16)];
+        ic.image = [UIImage systemImageNamed:icons[i]]; ic.contentMode = UIViewContentModeScaleAspectFit; ic.tag = 901; ic.userInteractionEnabled = NO;
+        [tb addSubview:ic];
+        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 6, 2, 20)]; bar.backgroundColor = NL_ACCENT; bar.tag = 900; [tb addSubview:bar];
+        [tb addTarget:self action:@selector(tabTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [side addSubview:tb]; [_tabs addObject:tb];
 
-    _lwLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 184, 150, 14)];
-    _lwLabel.textColor = UIColor.whiteColor; _lwLabel.font = [UIFont systemFontOfSize:10];
-    [_panel addSubview:_lwLabel];
-    UISlider *s1 = [[UISlider alloc] initWithFrame:CGRectMake(10, 198, 150, 26)];
-    s1.minimumValue = 0.5; s1.maximumValue = 4; s1.value = g_set.lw; s1.tag = 10;
-    [s1 addTarget:self action:@selector(slChanged:) forControlEvents:UIControlEventValueChanged];
-    [_panel addSubview:s1];
+        UIScrollView *pg = [[UIScrollView alloc] initWithFrame:CGRectMake(PX, PY, PW, PH)];
+        pg.showsVerticalScrollIndicator = NO; pg.alwaysBounceVertical = NO; pg.delaysContentTouches = NO;
+        [_panel addSubview:pg]; [_pages addObject:pg];
+    }
 
-    _hdLabel = [[UILabel alloc] initWithFrame:CGRectMake(170, 184, 150, 14)];
-    _hdLabel.textColor = UIColor.whiteColor; _hdLabel.font = [UIFont systemFontOfSize:10];
-    [_panel addSubview:_hdLabel];
-    UISlider *s2 = [[UISlider alloc] initWithFrame:CGRectMake(170, 198, 150, 26)];
-    s2.minimumValue = 1.4; s2.maximumValue = 2.2; s2.value = g_set.head; s2.tag = 11;
-    [s2 addTarget:self action:@selector(slChanged:) forControlEvents:UIControlEventValueChanged];
-    [_panel addSubview:s2];
-
-    _status = [[UILabel alloc] initWithFrame:CGRectMake(10, 228, 310, 46)];
-    _status.textColor = [UIColor colorWithWhite:0.8 alpha:1];
-    _status.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
-    _status.numberOfLines = 4;
-    [_panel addSubview:_status];
-    UIButton *lb = [UIButton buttonWithType:UIButtonTypeCustom];
-    lb.frame = CGRectMake(10, 276, 150, 26);
-    lb.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1]; lb.layer.cornerRadius = 6;
-    lb.titleLabel.font = [UIFont systemFontOfSize:12];
-    [lb setTitle:@"Learn look fields" forState:UIControlStateNormal];
-    [lb addTarget:self action:@selector(learnTapped) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:lb];
-    UILabel *al = [[UILabel alloc] initWithFrame:CGRectMake(170, 276, 96, 26)];
-    al.text = @"Aim lock"; al.textColor = UIColor.whiteColor; al.font = [UIFont systemFontOfSize:12];
-    [_panel addSubview:al];
-    UISwitch *as = [[UISwitch alloc] init];
-    as.transform = (CGAffineTransform){ 0.68, 0, 0, 0.68, 0, 0 };
-    as.center = CGPointMake(170 + 96 + 20, 289);
-    as.tag = 8; as.on = g_set.aim;
-    [as addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
-    [_panel addSubview:as];
-
-    _hpBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    _hpBtn.frame = CGRectMake(10, 306, 150, 26);
-    _hpBtn.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1]; _hpBtn.layer.cornerRadius = 6;
-    _hpBtn.titleLabel.font = [UIFont systemFontOfSize:12];
-    [_hpBtn setTitle:@"Learn health" forState:UIControlStateNormal];
-    [_hpBtn addTarget:self action:@selector(hpLearnTapped) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:_hpBtn];
-    UILabel *hl = [[UILabel alloc] initWithFrame:CGRectMake(170, 306, 96, 26)];
-    hl.text = @"Health bar"; hl.textColor = UIColor.whiteColor; hl.font = [UIFont systemFontOfSize:12];
-    [_panel addSubview:hl];
-    UISwitch *hs = [[UISwitch alloc] init];
-    hs.transform = (CGAffineTransform){ 0.68, 0, 0, 0.68, 0, 0 };
-    hs.center = CGPointMake(170 + 96 + 20, 319);
-    hs.tag = 9; hs.on = g_set.hp;
-    [hs addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
-    [_panel addSubview:hs];
+    // --- Aimbot ---
+    {
+        UIScrollView *pg = _pages[0];
+        NLCard a = nlCard(pg, @"Aim lock", 0, 0, CW);
+        nlToggle(a, @"Enabled", 8, g_set.aim, self, @selector(swChanged:));
+        nlToggle(a, @"Draw FOV", 15, g_set.drawFov, self, @selector(swChanged:));
+        _fovLabel = nlSlider(a, @"FOV", 13, 5, 90, g_set.fov, self, @selector(slChanged:));
+        _spdLabel = nlSlider(a, @"Speed", 14, 4, 40, g_set.aimSpeed, self, @selector(slChanged:));
+        nlEnd(a);
+        NLCard b = nlCard(pg, @"Look fields", CW + 8, 0, CW);
+        nlButton(b, @"Learn look fields", self, @selector(learnTapped));
+        _aimInfo = nlInfo(b, 72, 9);
+        nlEnd(b);
+        pg.contentSize = CGSizeMake(PW, fmax(CGRectGetMaxY(a.v.frame), CGRectGetMaxY(b.v.frame)) + 8);
+    }
+    // --- Visuals ---
+    {
+        UIScrollView *pg = _pages[1];
+        NLCard a = nlCard(pg, @"Players", 0, 0, CW);
+        nlToggle(a, @"ESP", 0, g_set.on, self, @selector(swChanged:));
+        nlToggle(a, @"Box", 1, g_set.box, self, @selector(swChanged:));
+        nlToggle(a, @"Box fill", 4, g_set.fill, self, @selector(swChanged:));
+        nlToggle(a, @"Skeleton", 2, g_set.skel, self, @selector(swChanged:));
+        nlToggle(a, @"Chams", 3, g_set.chams, self, @selector(swChanged:));
+        nlToggle(a, @"Head dot", 12, g_set.hdot, self, @selector(swChanged:));
+        nlToggle(a, @"Health bar", 9, g_set.hp, self, @selector(swChanged:));
+        nlToggle(a, @"Teammates", 5, g_set.team, self, @selector(swChanged:));
+        nlEnd(a);
+        NLCard b = nlCard(pg, @"Style", CW + 8, 0, CW);
+        nlSwatches(b, g_set.color, self, @selector(colorTapped:), _swatches);
+        _lwLabel = nlSlider(b, @"Line width", 10, 0.5, 4, g_set.lw, self, @selector(slChanged:));
+        _hdLabel = nlSlider(b, @"Box height", 11, 1.4, 2.2, g_set.head, self, @selector(slChanged:));
+        nlEnd(b);
+        NLCard c = nlCard(pg, @"Health", CW + 8, CGRectGetMaxY(b.v.frame) + 8, CW);
+        _hpBtn = nlButton(c, @"Learn health", self, @selector(hpLearnTapped));
+        nlEnd(c);
+        pg.contentSize = CGSizeMake(PW, fmax(CGRectGetMaxY(a.v.frame), CGRectGetMaxY(c.v.frame)) + 8);
+    }
+    // --- Misc ---
+    {
+        UIScrollView *pg = _pages[2];
+        NLCard a = nlCard(pg, @"Performance", 0, 0, CW);
+        nlToggle(a, @"Low CPU", 6, g_set.lowcpu, self, @selector(swChanged:));
+        nlToggle(a, @"No occlusion", 7, g_set.noocc, self, @selector(swChanged:));
+        nlEnd(a);
+        NLCard st = nlCard(pg, @"Status", 0, CGRectGetMaxY(a.v.frame) + 8, PW);
+        _status = nlInfo(st, 84, 8.5);
+        _status.textColor = nlRGB(150, 165, 190);
+        nlEnd(st);
+        pg.contentSize = CGSizeMake(PW, CGRectGetMaxY(st.v.frame) + 8);
+    }
+    [self selectTab:0];
     [self refreshLabels];
+}
+
+- (void)selectTab:(NSInteger)i {
+    NSArray *names = @[@"Aimbot", @"Visuals", @"Misc"];
+    for (NSInteger k = 0; k < (NSInteger)_pages.count; k++) {
+        BOOL on = (k == i);
+        ((UIScrollView *)_pages[k]).hidden = !on;
+        UIButton *b = _tabs[k];
+        b.backgroundColor = on ? [NL_ACCENT colorWithAlphaComponent:0.12] : UIColor.clearColor;
+        [b setTitleColor:on ? NL_ACCENT : NL_DIM forState:UIControlStateNormal];
+        [b viewWithTag:900].hidden = !on;
+        ((UIImageView *)[b viewWithTag:901]).tintColor = on ? NL_ACCENT : NL_DIM;
+    }
+    _tabTitle.text = names[i];
+}
+- (void)tabTapped:(UIButton *)b { [self selectTab:b.tag]; }
+- (void)colorTapped:(UIButton *)b {
+    g_set.color = (int)b.tag; g_dirty = true; saveSettings();
+    for (UIButton *sw in _swatches) sw.layer.borderWidth = (sw.tag == b.tag) ? 2 : 0;
 }
 
 - (void)panMoved:(UIPanGestureRecognizer *)g {
@@ -1427,12 +1599,13 @@ static NSString *diagRenderer(void *r) {
 }
 
 - (void)refreshLabels {
-    _lwLabel.text = [NSString stringWithFormat:@"Line width: %.1f", g_set.lw];
-    _hdLabel.text = [NSString stringWithFormat:@"Box height m: %.2f", g_set.head];
-    _fovLabel.text = [NSString stringWithFormat:@"Aim FOV %.0f", g_set.fov];
+    _lwLabel.text = [NSString stringWithFormat:@"%.1f", g_set.lw];
+    _hdLabel.text = [NSString stringWithFormat:@"%.2f m", g_set.head];
+    _fovLabel.text = [NSString stringWithFormat:@"%.0f\u00B0", g_set.fov];
+    _spdLabel.text = [NSString stringWithFormat:@"%.0f", g_set.aimSpeed];
 }
 
-- (void)swChanged:(UISwitch *)s {
+- (void)swChanged:(NLToggle *)s {
     switch (s.tag) {
         case 0: g_set.on = s.on; break;
         case 1: g_set.box = s.on; break;
@@ -1445,12 +1618,13 @@ static NSString *diagRenderer(void *r) {
         case 8: g_set.aim = s.on; break;
         case 9: g_set.hp = s.on; break;
         case 12: g_set.hdot = s.on; break;
+        case 15: g_set.drawFov = s.on; break;
     }
     g_dirty = true; saveSettings();
 }
 - (void)segChanged:(UISegmentedControl *)s { g_set.color = (int)s.selectedSegmentIndex; g_dirty = true; saveSettings(); }
 - (void)slChanged:(UISlider *)s {
-    if (s.tag == 10) g_set.lw = s.value; else if (s.tag == 13) g_set.fov = s.value; else g_set.head = s.value;
+    if (s.tag == 10) g_set.lw = s.value; else if (s.tag == 13) g_set.fov = s.value; else if (s.tag == 14) g_set.aimSpeed = s.value; else g_set.head = s.value;
     [self refreshLabels]; saveSettings();
 }
 - (void)plateTapped { _panel.hidden = !_panel.hidden; }
@@ -1490,11 +1664,11 @@ static NSString *diagRenderer(void *r) {
     if (!_btn) {
         _btn = [UIButton buttonWithType:UIButtonTypeCustom];
         _btn.frame = CGRectMake(8, 44, 64, 24);
-        _btn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
-        _btn.layer.cornerRadius = 6;
-        _btn.titleLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightSemibold];
-        [_btn setTitle:@"ESP \u2699" forState:UIControlStateNormal];
-        [_btn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        _btn.backgroundColor = [NL_WIN colorWithAlphaComponent:0.85];
+        _btn.layer.cornerRadius = 7; _btn.layer.borderWidth = 1; _btn.layer.borderColor = [NL_ACCENT colorWithAlphaComponent:0.7].CGColor;
+        _btn.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightHeavy];
+        [_btn setTitle:@"SCESP" forState:UIControlStateNormal];
+        [_btn setTitleColor:NL_ACCENT forState:UIControlStateNormal];
         [_btn addTarget:self action:@selector(plateTapped) forControlEvents:UIControlEventTouchUpInside];
         [self buildPanel];
     }
@@ -1527,6 +1701,9 @@ static NSString *diagRenderer(void *r) {
         _hdot = [CAShapeLayer layer];
         _hdot.strokeColor = [UIColor colorWithWhite:0 alpha:0.85].CGColor; _hdot.lineWidth = 1;
         [_overlay.layer addSublayer:_hdot];
+        _fovRing = [CAShapeLayer layer];
+        _fovRing.fillColor = UIColor.clearColor.CGColor; _fovRing.lineWidth = 1.2;
+        [_overlay.layer addSublayer:_fovRing];
     }
     if (_overlay.superview != win) { [_overlay removeFromSuperview]; [win insertSubview:_overlay belowSubview:_btn]; }
 
@@ -1535,6 +1712,7 @@ static NSString *diagRenderer(void *r) {
     UIBezierPath *hpBack = [UIBezierPath bezierPath], *hpG = [UIBezierPath bezierPath], *hpY = [UIBezierPath bezierPath], *hpR = [UIBezierPath bezierPath];
     bool wantHp = g_set.hp && g_haveHp;
     UIBezierPath *dotPath = [UIBezierPath bezierPath];
+    UIBezierPath *fovPath = [UIBezierPath bezierPath];
     int drawn = 0, myTeam = -1;
     bool camOk = false;
     std::vector<void *> wantChams;
@@ -1572,7 +1750,7 @@ static NSString *diagRenderer(void *r) {
                 }
                 for (auto &p : ps) if (p.self && g_teamField >= 0) myTeam = readTeam(p.obj, g_teamField);
 
-                std::vector<V3> tg; void *meObj = nullptr;
+                std::vector<AimTg> tg; void *meObj = nullptr;
                 for (auto &p : ps) if (p.self) meObj = p.obj;
                 std::vector<CGPoint> sp; std::vector<char> okp;
                 for (auto &p : ps) {
@@ -1608,7 +1786,14 @@ static NSString *diagRenderer(void *r) {
                         if (y < minY) minY = y;
                         if (y > maxY) maxY = y;
                     }
-                    if (hy > -1e8f) tg.push_back(hw); else tg.push_back({ p.pos.x, p.pos.y + 1.6f, p.pos.z });
+                    {
+                        bool dead = false;
+                        if (wantHp) { float hv0; if (readCand(g_hpC, p.obj, &pi, hv0) && hv0 <= 0.f) dead = true; }   // never lock on corpses
+                        if (!dead) {
+                            if (hy > -1e8f) tg.push_back({ hw, p.obj });
+                            else tg.push_back({ { p.pos.x, p.pos.y + 1.6f, p.pos.z }, p.obj });
+                        }
+                    }
                     bool haveBones = good >= 6;
 
                     if (g_set.hdot) {      // head dot: highest valid bone, or the pivot + box height when bones are missing
@@ -1659,6 +1844,23 @@ static NSString *diagRenderer(void *r) {
                     }
                     drawn++;
                 }
+                // ---- aim FOV outline: exactly the set of directions the target selection accepts ----
+                if (g_set.drawFov && mi_fwd && d_fwd) {
+                    V3 f0 = d_fwd(ctr, mi_fwd);
+                    float cy0 = atan2f(f0.x, f0.z) * 57.29578f;
+                    float cp0 = -asinf(fmaxf(-1.f, fminf(1.f, f0.y))) * 57.29578f;
+                    const int N = 72;
+                    bool brk = true;
+                    for (int i = 0; i <= N; i++) {
+                        float ph = (float)i / N * 6.2831853f;
+                        float yaw = (cy0 + g_set.fov * cosf(ph)) * 0.0174533f, pit = (cp0 + g_set.fov * sinf(ph)) * 0.0174533f;
+                        V3 wp = { camPos.x + sinf(yaw) * cosf(pit) * 20.f, camPos.y - sinf(pit) * 20.f, camPos.z + cosf(yaw) * cosf(pit) * 20.f };
+                        V3 s2 = d_world2screen(cam, wp, mi_w2s);
+                        if (s2.z <= 0) { brk = true; continue; }
+                        CGPoint pt = CGPointMake(s2.x / sw * vs.width, (1.0 - s2.y / sh) * vs.height);
+                        if (brk) { [fovPath moveToPoint:pt]; brk = false; } else [fovPath addLineToPoint:pt];
+                    }
+                }
                 // ---- aim lock / learning (offline) ----
                 if (meObj && mi_fwd && d_fwd) {
                     V3 f = d_fwd(ctr, mi_fwd);
@@ -1672,20 +1874,22 @@ static NSString *diagRenderer(void *r) {
                     } else if (g_probeAxis >= 0) {
                         probeStep(meObj, aimObj, curYaw, curPit, now);
                     } else if (g_set.aim && g_haveYaw && g_havePit && !tg.empty()) {
-                        float best = g_set.fov, dyB = 0, dpB = 0; bool got = false;
+                        double dt = fmin(0.05, fmax(0.004, now - g_aimLastW));
+                        g_aimLastW = now;
+                        float best = 1e9f, dyB = 0, dpB = 0; bool got = false; void *bestId = nullptr;
                         for (auto &t : tg) {
-                            float dx = t.x - camPos.x, dy = t.y - camPos.y, dz = t.z - camPos.z;
+                            float dx = t.pos.x - camPos.x, dy = t.pos.y - camPos.y, dz = t.pos.z - camPos.z;
                             float len = sqrtf(dx * dx + dy * dy + dz * dz);
                             if (len < 0.5f) continue;
                             float ey = wrap180(atan2f(dx, dz) * 57.29578f - curYaw), ep = -asinf(dy / len) * 57.29578f - curPit;
                             float e = sqrtf(ey * ey + ep * ep);
-                            if (e < best) { best = e; dyB = ey; dpB = ep; got = true; }
+                            bool cur = t.id && t.id == g_lockId;
+                            if (e > g_set.fov * (cur ? 1.3f : 1.0f)) continue;      // hysteresis: a locked target may drift out a bit further
+                            float score = cur ? e * 0.55f : e;                      // sticky: only switch when another bot is clearly closer
+                            if (score < best) { best = score; dyB = ey; dpB = ep; got = true; bestId = t.id; }
                         }
-                        bool camMoved = fabsf(wrap180(curYaw - g_aimLwY)) > 0.02f || fabsf(curPit - g_aimLwP) > 0.02f;
-                        if (got && now - g_aimLastW > 0.025 && (camMoved || now - g_aimLastW > 0.12)) {
-                            aimStep(meObj, aimObj, dyB, dpB);
-                            g_aimLastW = now; g_aimLwY = curYaw; g_aimLwP = curPit;
-                        }
+                        g_lockId = got ? bestId : nullptr;
+                        if (got) aimStep(meObj, aimObj, dyB, dpB, (float)dt);
                     }
                 }
             }
@@ -1725,6 +1929,8 @@ static NSString *diagRenderer(void *r) {
     _boxes.lineWidth = g_set.lw; _skel.lineWidth = g_set.lw;
     _boxes.path = boxPath.CGPath; _skel.path = skelPath.CGPath;
     for (CAShapeLayer *hl in @[_hpBack, _hpG, _hpY, _hpR]) hl.frame = _overlay.bounds;
+    _fovRing.frame = _overlay.bounds; _fovRing.path = fovPath.CGPath;
+    _fovRing.strokeColor = ((g_set.aim && g_lockId) ? nlRGB(70, 255, 120, 0.95) : nlRGB(61, 166, 255, 0.75)).CGColor;
     _hdot.frame = _overlay.bounds; _hdot.path = dotPath.CGPath; _hdot.fillColor = colorFor(g_set.color, 1).CGColor;
     _hpBack.path = hpBack.CGPath; _hpG.path = hpG.CGPath; _hpY.path = hpY.CGPath; _hpR.path = hpR.CGPath;
     [CATransaction commit];
@@ -1742,6 +1948,7 @@ static NSString *diagRenderer(void *r) {
                          : (g_set.aim ? ((g_haveYaw && g_havePit) ? @"aim: ON, look fields learned" : @"aim: ON but NOT learned -> Learn look fields")
                                       : diagRenderer(diagR));
             _status.text = [_status.text stringByAppendingFormat:@"\n%@\n%@", l3, g_hpMsg];
+            _aimInfo.text = l3;
         } @catch (...) {}
     }
 }
