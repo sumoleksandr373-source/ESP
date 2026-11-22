@@ -24,6 +24,8 @@
 #include <unordered_map>
 #include <ctype.h>
 #include <string>
+#include <algorithm>
+#include <math.h>
 
 // ---- config ----------------------------------------------------------------------------
 static const char *kGameImage = "Chillow.StandChillow.Client.dll";
@@ -46,7 +48,7 @@ static const float kAimFov = 18.0f;   // degrees: aim lock only grabs targets th
 
 // ---- settings --------------------------------------------------------------------------
 struct Settings {
-    bool on = true, box = true, skel = true, chams = false, fill = false, team = false, lowcpu = false, noocc = true, aim = false, hp = true;
+    bool on = true, box = true, skel = true, chams = false, fill = false, team = false, lowcpu = false, noocc = true, aim = false, hp = true, hdot = true;
     int color = 0;
     float lw = 1.5f;
     float head = 1.8f;
@@ -73,6 +75,7 @@ static void saveSettings() {
     [d setBool:g_set.lowcpu forKey:@"scesp_low"];
     [d setBool:g_set.noocc forKey:@"scesp_noocc"];
     [d setBool:g_set.hp forKey:@"scesp_hp"];
+    [d setBool:g_set.hdot forKey:@"scesp_hdot"];
     [d setInteger:g_set.color forKey:@"scesp_color"];
     [d setFloat:g_set.lw forKey:@"scesp_lw"];      [d setFloat:g_set.head forKey:@"scesp_head"];
 }
@@ -84,6 +87,7 @@ static void loadSettings() {
     g_set.fill = [d boolForKey:@"scesp_fill"];     g_set.team = [d boolForKey:@"scesp_team"];
     g_set.lowcpu = [d boolForKey:@"scesp_low"];
     g_set.noocc = [d objectForKey:@"scesp_noocc"] ? [d boolForKey:@"scesp_noocc"] : true;
+    g_set.hdot = [d objectForKey:@"scesp_hdot"] ? [d boolForKey:@"scesp_hdot"] : true;
     g_set.hp = [d objectForKey:@"scesp_hp"] ? [d boolForKey:@"scesp_hp"] : true;
     g_set.color = (int)[d integerForKey:@"scesp_color"];
     g_set.lw = [d floatForKey:@"scesp_lw"];        g_set.head = [d floatForKey:@"scesp_head"];
@@ -121,6 +125,7 @@ typedef const uint16_t *(*fn_string_chars)(void *);
 typedef int (*fn_string_length)(void *);
 typedef void *(*fn_class_from_type)(void *);
 typedef bool (*fn_class_is_vt)(void *);
+typedef const char *(*fn_field_get_name)(void *);
 
 static fn_domain_get il2_domain_get;
 static fn_domain_get_assemblies il2_get_assemblies;
@@ -151,6 +156,7 @@ static fn_string_chars il2_str_chars;
 static fn_string_length il2_str_len;
 static fn_class_from_type il2_class_from_type;
 static fn_class_is_vt il2_class_is_vt;
+static fn_field_get_name il2_field_name;
 // engine icalls: exist in the native engine even when the managed wrapper is stripped from the build
 typedef void *(*fn_resolve_icall)(const char *);
 typedef void (*ic_set_bool)(void *, bool);
@@ -205,6 +211,7 @@ static bool loadApi() {
     il2_str_len         = (fn_string_length)sym("il2cpp_string_length");   // optional
     il2_class_from_type = (fn_class_from_type)sym("il2cpp_class_from_type");   // optional (aim learning)
     il2_class_is_vt     = (fn_class_is_vt)sym("il2cpp_class_is_valuetype");    // optional
+    il2_field_name      = (fn_field_get_name)sym("il2cpp_field_get_name");         // optional (diagnostics)
     il2_resolve_icall   = (fn_resolve_icall)sym("il2cpp_resolve_icall");          // optional
     return il2_domain_get && il2_get_assemblies && il2_asm_image && il2_image_name &&
            il2_class_from_name && il2_get_method && il2_invoke && il2_class_type &&
@@ -392,27 +399,29 @@ static inline int readTeam(void *obj, int field) {
 // The correction is computed from the camera's real forward vector every tick, so recoil kicks are
 // compensated one tick later.
 static std::vector<uint32_t> g_aimH;
-struct Cand { uint8_t src, deref; int off, off2; };
-struct Stat { float last = 0; bool have = false; double sv2 = 0, sy2 = 0, sp2 = 0, svy = 0, svp = 0; int n = 0; };
+struct Cand { uint8_t src, deref; int off, off2; const char *n1, *n2; };
+struct Stat { float last = 0; bool have = false; double sv2 = 0, sy2 = 0, sp2 = 0, svy = 0, svp = 0, wdv = 0; int n = 0; };
 static std::vector<Cand> g_cands;
 static std::vector<Stat> g_stats;
 static bool g_learn = false, g_lhave = false;
 static float g_ly = 0, g_lp = 0;
 static double g_learnT0 = 0, g_msgUntil = 0;
 static NSString *g_learnMsg = @"aim: not learned";
-static Cand g_yawC = {0, 0, 0, 0}, g_pitC = {0, 0, 0, 0};
+static Cand g_yawC = {0, 0, 0, 0, nullptr, nullptr}, g_pitC = {0, 0, 0, 0, nullptr, nullptr};
 static float g_yawK = 0, g_pitK = 0;
 static bool g_haveYaw = false, g_havePit = false;
 
 static inline float wrap180(float a) { while (a > 180.f) a -= 360.f; while (a < -180.f) a += 360.f; return a; }
 
-static void pushCand(uint8_t src, int mode, int outer, int off) {
-    if (g_cands.size() > 4000) return;
-    if (mode == 0)      g_cands.push_back({ src, 0, off, 0 });
-    else if (mode == 1) g_cands.push_back({ src, 0, outer + off - 16, 0 });   // inline struct
-    else                g_cands.push_back({ src, 1, outer, off });            // through a reference
+static void pushCand(uint8_t src, int mode, int outer, int off, const char *fn, const char *on) {
+    if (g_cands.size() > 8000) return;
+    Cand c; c.src = src; c.n1 = on; c.n2 = fn;
+    if (mode == 0)      { c.deref = 0; c.off = off; c.off2 = 0; }
+    else if (mode == 1) { c.deref = 0; c.off = outer + off - 16; c.off2 = 0; }   // inline struct
+    else                { c.deref = 1; c.off = outer; c.off2 = off; }            // through a reference
+    g_cands.push_back(c);
 }
-static void scanClass(void *klass, uint8_t src, int mode, int outer, int depth) {
+static void scanClass(void *klass, uint8_t src, int mode, int outer, int depth, const char *oname = nullptr) {
     for (void *k = klass; k; k = il2_class_parent(k)) {
         void *iter = nullptr, *f;
         while ((f = il2_class_fields(k, &iter))) {
@@ -421,11 +430,13 @@ static void scanClass(void *klass, uint8_t src, int mode, int outer, int depth) 
             const char *tn = ft ? il2_type_name(ft) : nullptr;
             if (!tn) continue;
             int off = il2_field_offset(f);
-            if (!strcmp(tn, "System.Single")) pushCand(src, mode, outer, off);
-            else if (!strcmp(tn, "UnityEngine.Vector2")) { pushCand(src, mode, outer, off); pushCand(src, mode, outer, off + 4); }
-            else if (depth == 0 && mode == 0 && il2_class_from_type && il2_class_is_vt && !strncmp(tn, "Chillow.StandChillow.Player.", 28)) {
+            const char *fn = il2_field_name ? il2_field_name(f) : "?";
+            if (!strcmp(tn, "System.Single")) pushCand(src, mode, outer, off, fn, oname);
+            else if (!strcmp(tn, "UnityEngine.Vector2")) { pushCand(src, mode, outer, off, fn, oname); pushCand(src, mode, outer, off + 4, fn, oname); }
+            else if (!strcmp(tn, "UnityEngine.Vector3")) { for (int q = 0; q < 3; q++) pushCand(src, mode, outer, off + 4 * q, fn, oname); }   // euler angles
+            else if (depth == 0 && mode == 0 && il2_class_from_type && il2_class_is_vt && !strncmp(tn, "Chillow.StandChillow.", 21)) {
                 void *nk = il2_class_from_type(ft);
-                if (nk) scanClass(nk, src, il2_class_is_vt(nk) ? 1 : 2, off, 1);
+                if (nk) scanClass(nk, src, il2_class_is_vt(nk) ? 1 : 2, off, 1, fn);
             }
         }
     }
@@ -461,15 +472,22 @@ static void loadAim() {
     if (p.count == 5) { g_pitC.src = [p[0] intValue]; g_pitC.deref = [p[1] intValue]; g_pitC.off = [p[2] intValue]; g_pitC.off2 = [p[3] intValue]; g_pitK = [p[4] floatValue]; g_havePit = true; }
     if (g_haveYaw && g_havePit) g_learnMsg = @"aim: learned fields loaded";
 }
+// Correlation is taken over ~6-tick windows (about 0.1 s): the game applies its look input a frame
+// before / after the camera transform moves, so per-tick deltas of the right field do not line up.
+static float g_wdy = 0, g_wdp = 0, g_totY = 0, g_totP = 0;
+static int g_wn = 0;
+static NSString *candName(const Cand &c) {
+    return [NSString stringWithFormat:@"%s%s%s%s", c.src ? "aim." : "me.", c.n1 ? c.n1 : "", c.n1 ? "." : "", c.n2 ? c.n2 : "?"];
+}
 static void learnStep(void *me, void *aim, float yaw, float pit) {
     if (!g_lhave) {
-        g_ly = yaw; g_lp = pit; g_lhave = true;
-        for (size_t i = 0; i < g_cands.size(); i++) { float *a = candAddr(g_cands[i], me, aim); g_stats[i].have = a != nullptr; if (a) g_stats[i].last = *a; }
+        g_ly = yaw; g_lp = pit; g_lhave = true; g_wdy = g_wdp = 0; g_wn = 0; g_totY = g_totP = 0;
+        for (size_t i = 0; i < g_cands.size(); i++) { float *a = candAddr(g_cands[i], me, aim); g_stats[i].have = a != nullptr; g_stats[i].wdv = 0; if (a) g_stats[i].last = *a; }
         return;
     }
     float dy = wrap180(yaw - g_ly), dp = pit - g_lp;
     g_ly = yaw; g_lp = pit;
-    bool moved = fabsf(dy) > 0.15f || fabsf(dp) > 0.15f;
+    g_wdy += dy; g_wdp += dp; g_totY += fabsf(dy); g_totP += fabsf(dp);
     for (size_t i = 0; i < g_cands.size(); i++) {
         Stat &s = g_stats[i];
         float *a = candAddr(g_cands[i], me, aim);
@@ -478,29 +496,61 @@ static void learnStep(void *me, void *aim, float yaw, float pit) {
         if (!s.have) { s.last = v; s.have = true; continue; }
         float dv = v - s.last; s.last = v;
         if (dv > 180.f) dv -= 360.f; else if (dv < -180.f) dv += 360.f;
-        if (!moved || dv != dv || fabsf(dv) > 200.f || fabsf(dy) > 90.f) continue;
-        s.sv2 += (double)dv * dv; s.sy2 += (double)dy * dy; s.sp2 += (double)dp * dp;
-        s.svy += (double)dv * dy; s.svp += (double)dv * dp; s.n++;
+        if (dv == dv && fabsf(dv) < 200.f) s.wdv += dv;
     }
+    if (++g_wn < 6) return;
+    bool moved = fabsf(g_wdy) > 0.3f || fabsf(g_wdp) > 0.3f;
+    if (moved && fabsf(g_wdy) < 90.f) {
+        for (size_t i = 0; i < g_cands.size(); i++) {
+            Stat &s = g_stats[i];
+            double dv = s.wdv;
+            s.sv2 += dv * dv; s.sy2 += (double)g_wdy * g_wdy; s.sp2 += (double)g_wdp * g_wdp;
+            s.svy += dv * g_wdy; s.svp += dv * g_wdp; s.n++;
+        }
+    }
+    for (auto &s : g_stats) s.wdv = 0;
+    g_wdy = g_wdp = 0; g_wn = 0;
 }
 static void learnFinish() {
     g_learn = false; g_lhave = false;
-    int by = -1, bp = -1; double cy = 0.97, cp = 0.97, ky = 0, kp = 0;
+    const double kAccept = 0.90;
+    struct R { double ry, rp, sy, sp; };
+    std::vector<R> rs(g_cands.size(), R{0, 0, 0, 0});
+    int by = -1, bp = -1; double cy = 0, cp = 0, ky = 0, kp = 0;
+    size_t used = 0;
     for (size_t i = 0; i < g_cands.size(); i++) {
         Stat &s = g_stats[i];
-        if (s.n < 12 || s.sv2 < 1e-12) continue;
-        double ry = s.svy / sqrt(s.sv2 * s.sy2 + 1e-18), rp = s.svp / sqrt(s.sv2 * s.sp2 + 1e-18);
-        double sy = s.svy / (s.sy2 + 1e-12), sp = s.svp / (s.sp2 + 1e-12);
-        if (s.sy2 > 20 && fabs(ry) > cy && fabs(sy) > 0.005 && fabs(sy) < 50) { cy = fabs(ry); by = (int)i; ky = sy; }
-        if (s.sp2 > 20 && fabs(rp) > cp && fabs(sp) > 0.005 && fabs(sp) < 50) { cp = fabs(rp); bp = (int)i; kp = sp; }
+        if (s.n < 8 || s.sv2 < 1e-12) continue;
+        used++;
+        R &r = rs[i];
+        r.ry = s.svy / sqrt(s.sv2 * s.sy2 + 1e-18); r.rp = s.svp / sqrt(s.sv2 * s.sp2 + 1e-18);
+        r.sy = s.svy / (s.sy2 + 1e-12);             r.sp = s.svp / (s.sp2 + 1e-12);
+        if (s.sy2 > 20 && fabs(r.sy) > 0.005 && fabs(r.sy) < 50 && fabs(r.ry) > cy) { cy = fabs(r.ry); by = (int)i; ky = r.sy; }
+        if (s.sp2 > 20 && fabs(r.sp) > 0.005 && fabs(r.sp) < 50 && fabs(r.rp) > cp) { cp = fabs(r.rp); bp = (int)i; kp = r.sp; }
     }
-    if (by >= 0 && by == bp) bp = -1;
-    if (by >= 0) { g_yawC = g_cands[by]; g_yawK = (float)ky; g_haveYaw = true; }
-    if (bp >= 0) { g_pitC = g_cands[bp]; g_pitK = (float)kp; g_havePit = true; }
-    saveAim();
-    g_learnMsg = [NSString stringWithFormat:@"learn: yaw %s (%.2f) pitch %s (%.2f) of %zu", by >= 0 ? "OK" : "NO", cy, bp >= 0 ? "OK" : "NO", cp, g_cands.size()];
-    g_msgUntil = CACurrentMediaTime() + 10;
-    NSLog(@"[SCESP] %@  yaw k=%.4f off=%d/%d  pit k=%.4f off=%d/%d", g_learnMsg, g_yawK, g_yawC.off, g_yawC.off2, g_pitK, g_pitC.off, g_pitC.off2);
+    bool okY = by >= 0 && cy >= kAccept, okP = bp >= 0 && cp >= kAccept;
+    if (okY && okP && by == bp) { if (cy >= cp) okP = false; else okY = false; }
+    if (okY) { g_yawC = g_cands[by]; g_yawK = (float)ky; g_haveYaw = true; }
+    if (okP) { g_pitC = g_cands[bp]; g_pitK = (float)kp; g_havePit = true; }
+    if (okY || okP) saveAim();
+
+    // full report -> clipboard + log, so the numbers can be inspected without a console
+    NSMutableString *rep = [NSMutableString stringWithFormat:@"cands=%zu used=%zu rot yaw=%.0f pit=%.0f deg\n", g_cands.size(), used, g_totY, g_totP];
+    for (int axis = 0; axis < 2; axis++) {
+        std::vector<std::pair<double, size_t>> top;
+        for (size_t i = 0; i < g_cands.size(); i++) if (g_stats[i].n >= 8 && g_stats[i].sv2 > 1e-12) top.push_back({ fabs(axis ? rs[i].rp : rs[i].ry), i });
+        std::sort(top.begin(), top.end(), [](const std::pair<double, size_t> &a, const std::pair<double, size_t> &b) { return a.first > b.first; });
+        [rep appendFormat:@"-- top %s --\n", axis ? "pitch" : "yaw"];
+        for (size_t t = 0; t < top.size() && t < 12; t++) {
+            const Cand &c = g_cands[top[t].second]; const R &r = rs[top[t].second];
+            [rep appendFormat:@"%.3f k=%.4f %@ off=%d/%d\n", top[t].first, axis ? r.sp : r.sy, candName(c), c.off, c.off2];
+        }
+    }
+    UIPasteboard.generalPasteboard.string = rep;
+    NSLog(@"[SCESP] learn report\n%@", rep);
+
+    g_learnMsg = [NSString stringWithFormat:@"learn: yaw %s %.2f pit %s %.2f rot %.0f/%.0f (copied)", okY ? "OK" : "NO", cy, okP ? "OK" : "NO", cp, g_totY, g_totP];
+    g_msgUntil = CACurrentMediaTime() + 20;
 }
 static void aimStep(void *me, void *aim, float dyaw, float dpit) {
     float *py = candAddr(g_yawC, me, aim), *pp = candAddr(g_pitC, me, aim);
@@ -657,7 +707,7 @@ static HCand g_hpC = {0, 0, 0, 0};
 static bool g_haveHp = false;
 static int g_hpLearn = 0;                 // 0 idle, 1 snapshot taken (waiting for the hit)
 static float g_hpRef = 0;                 // "full health" reference = highest value seen on the learned field
-static NSString *g_hpMsg = @"health: not learned";
+static NSString *g_hpMsg = @"hp: not learned";
 static double g_hpMsgUntil = 0;
 static std::unordered_map<void *, std::vector<float>> g_hpSnap;
 
@@ -702,14 +752,14 @@ static void loadHp() {
     NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:@"scesp_hpc"];
     if (a.count != 5) return;
     g_hpC.deref = [a[0] intValue]; g_hpC.isInt = [a[1] intValue]; g_hpC.off = [a[2] intValue]; g_hpC.off2 = [a[3] intValue];
-    g_hpRef = [a[4] floatValue]; g_haveHp = true; g_hpMsg = @"health: learned field loaded";
+    g_hpRef = [a[4] floatValue]; g_haveHp = true; g_hpMsg = @"hp: learned field loaded";
 }
 static void hpSay(NSString *m, double secs) { g_hpMsg = m; g_hpMsgUntil = CACurrentMediaTime() + secs; NSLog(@"[SCESP] %@", m); }
 
 // returns true when the button should show the "waiting for hit" caption
 static bool hpLearnTap() {
     if (g_hpLearn == 0) {
-        if (g_active < 0 || !k_targets[g_active]) { hpSay(@"health: no player class yet", 5); return false; }
+        if (g_active < 0 || !k_targets[g_active]) { hpSay(@"hp: no player class yet", 5); return false; }
         g_hc.clear(); g_hpSnap.clear();
         scanHpClass(k_targets[g_active], 0, 0);
         for (auto &pi : g_pl) {
@@ -719,9 +769,9 @@ static bool hpLearnTap() {
             for (size_t i = 0; i < g_hc.size(); i++) { float x; if (readCand(g_hc[i], o, x)) v[i] = x; }
             g_hpSnap[o] = std::move(v);
         }
-        if (g_hpSnap.size() < 2) { hpSay(@"health: need me + at least one bot in the match", 6); return false; }
+        if (g_hpSnap.size() < 2) { hpSay(@"hp: need 2+ characters in the scene", 6); return false; }
         g_hpLearn = 1;
-        hpSay([NSString stringWithFormat:@"health: %zu fields, %zu chars. hit ONE bot once, then tap again", g_hc.size(), g_hpSnap.size()], 600);
+        hpSay([NSString stringWithFormat:@"hp: %zuf/%zuch - hit 1 enemy once, tap again", g_hc.size(), g_hpSnap.size()], 600);
         return true;
     }
     g_hpLearn = 0;
@@ -742,13 +792,13 @@ static bool hpLearnTap() {
         for (auto &kv : g_hpSnap) if (kv.second[i] == before) score++;
         if (score > bestScore) { bestScore = score; best = (int)i; bestBefore = before; }
     }
-    if (best < 0) { hpSay(@"health: nothing matched. hit a bot (not yourself) once and try again", 8); g_hpSnap.clear(); return false; }
+    if (best < 0) { hpSay(@"hp: no match - hit ONE enemy once, retry", 8); g_hpSnap.clear(); return false; }
     g_hpC = g_hc[best]; g_haveHp = true;
     float ref = bestBefore;
     for (auto &kv : g_hpSnap) if (kv.second[best] == kv.second[best] && kv.second[best] > ref) ref = kv.second[best];
     g_hpRef = ref;
     saveHp();
-    hpSay([NSString stringWithFormat:@"health: OK %s off=%d/%d full=%.0f (%zu cand)", g_hpC.isInt ? "int" : "float", g_hpC.off, g_hpC.off2, g_hpRef, matches], 10);
+    hpSay([NSString stringWithFormat:@"hp OK %s off=%d/%d full=%.0f (%zu)", g_hpC.isInt ? "int" : "float", g_hpC.off, g_hpC.off2, g_hpRef, matches], 10);
     g_hpSnap.clear();
     return false;
 }
@@ -1025,7 +1075,7 @@ static NSString *diagRenderer(void *r) {
 @implementation SCESPDriver {
     UIView *_overlay;
     CAShapeLayer *_boxes, *_skel;
-    CAShapeLayer *_hpBack, *_hpG, *_hpY, *_hpR;
+    CAShapeLayer *_hpBack, *_hpG, *_hpY, *_hpR, *_hdot;
     UIButton *_btn, *_hpBtn;
     UIView *_panel;
     UILabel *_status;
@@ -1044,7 +1094,7 @@ static NSString *diagRenderer(void *r) {
 }
 
 - (void)addSwitch:(NSString *)title col:(int)col row:(int)row tag:(int)tag on:(BOOL)on {
-    CGFloat cx = col ? 170 : 10, y = 30 + row * 28;
+    CGFloat cx = col ? 170 : 10, y = 30 + row * 24;
     UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(cx, y, 96, 26)];
     l.text = title; l.textColor = UIColor.whiteColor; l.font = [UIFont systemFontOfSize:12];
     l.adjustsFontSizeToFitWidth = YES; l.minimumScaleFactor = 0.7;
@@ -1057,7 +1107,7 @@ static NSString *diagRenderer(void *r) {
 }
 
 - (void)buildPanel {
-    _panel = [[UIView alloc] initWithFrame:CGRectMake(8, 72, 330, 344)];
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(8, 72, 330, 338)];
     _panel.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
     _panel.layer.cornerRadius = 10;
     _panel.hidden = YES;
@@ -1081,64 +1131,65 @@ static NSString *diagRenderer(void *r) {
     [self addSwitch:@"Teammates" col:1 row:2 tag:5 on:g_set.team];
     [self addSwitch:@"Low CPU" col:0 row:3 tag:6 on:g_set.lowcpu];
     [self addSwitch:@"No occlusion" col:1 row:3 tag:7 on:g_set.noocc];
+    [self addSwitch:@"Head dot" col:0 row:4 tag:12 on:g_set.hdot];
 
     UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"R", @"G", @"C", @"Y", @"W", @"M", @"O"]];
-    seg.frame = CGRectMake(10, 148, 310, 26);
+    seg.frame = CGRectMake(10, 154, 310, 26);
     seg.selectedSegmentIndex = g_set.color;
     [seg addTarget:self action:@selector(segChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:seg];
 
-    _lwLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 180, 150, 14)];
+    _lwLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 184, 150, 14)];
     _lwLabel.textColor = UIColor.whiteColor; _lwLabel.font = [UIFont systemFontOfSize:10];
     [_panel addSubview:_lwLabel];
-    UISlider *s1 = [[UISlider alloc] initWithFrame:CGRectMake(10, 194, 150, 26)];
+    UISlider *s1 = [[UISlider alloc] initWithFrame:CGRectMake(10, 198, 150, 26)];
     s1.minimumValue = 0.5; s1.maximumValue = 4; s1.value = g_set.lw; s1.tag = 10;
     [s1 addTarget:self action:@selector(slChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:s1];
 
-    _hdLabel = [[UILabel alloc] initWithFrame:CGRectMake(170, 180, 150, 14)];
+    _hdLabel = [[UILabel alloc] initWithFrame:CGRectMake(170, 184, 150, 14)];
     _hdLabel.textColor = UIColor.whiteColor; _hdLabel.font = [UIFont systemFontOfSize:10];
     [_panel addSubview:_hdLabel];
-    UISlider *s2 = [[UISlider alloc] initWithFrame:CGRectMake(170, 194, 150, 26)];
+    UISlider *s2 = [[UISlider alloc] initWithFrame:CGRectMake(170, 198, 150, 26)];
     s2.minimumValue = 1.4; s2.maximumValue = 2.2; s2.value = g_set.head; s2.tag = 11;
     [s2 addTarget:self action:@selector(slChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:s2];
 
-    _status = [[UILabel alloc] initWithFrame:CGRectMake(10, 224, 310, 50)];
+    _status = [[UILabel alloc] initWithFrame:CGRectMake(10, 228, 310, 46)];
     _status.textColor = [UIColor colorWithWhite:0.8 alpha:1];
     _status.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
     _status.numberOfLines = 4;
     [_panel addSubview:_status];
     UIButton *lb = [UIButton buttonWithType:UIButtonTypeCustom];
-    lb.frame = CGRectMake(10, 280, 150, 26);
+    lb.frame = CGRectMake(10, 276, 150, 26);
     lb.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1]; lb.layer.cornerRadius = 6;
     lb.titleLabel.font = [UIFont systemFontOfSize:12];
     [lb setTitle:@"Learn look fields" forState:UIControlStateNormal];
     [lb addTarget:self action:@selector(learnTapped) forControlEvents:UIControlEventTouchUpInside];
     [_panel addSubview:lb];
-    UILabel *al = [[UILabel alloc] initWithFrame:CGRectMake(170, 280, 96, 26)];
+    UILabel *al = [[UILabel alloc] initWithFrame:CGRectMake(170, 276, 96, 26)];
     al.text = @"Aim lock"; al.textColor = UIColor.whiteColor; al.font = [UIFont systemFontOfSize:12];
     [_panel addSubview:al];
     UISwitch *as = [[UISwitch alloc] init];
     as.transform = (CGAffineTransform){ 0.68, 0, 0, 0.68, 0, 0 };
-    as.center = CGPointMake(170 + 96 + 20, 293);
+    as.center = CGPointMake(170 + 96 + 20, 289);
     as.tag = 8; as.on = g_set.aim;
     [as addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:as];
 
     _hpBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    _hpBtn.frame = CGRectMake(10, 312, 150, 26);
+    _hpBtn.frame = CGRectMake(10, 306, 150, 26);
     _hpBtn.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1]; _hpBtn.layer.cornerRadius = 6;
     _hpBtn.titleLabel.font = [UIFont systemFontOfSize:12];
     [_hpBtn setTitle:@"Learn health" forState:UIControlStateNormal];
     [_hpBtn addTarget:self action:@selector(hpLearnTapped) forControlEvents:UIControlEventTouchUpInside];
     [_panel addSubview:_hpBtn];
-    UILabel *hl = [[UILabel alloc] initWithFrame:CGRectMake(170, 312, 96, 26)];
+    UILabel *hl = [[UILabel alloc] initWithFrame:CGRectMake(170, 306, 96, 26)];
     hl.text = @"Health bar"; hl.textColor = UIColor.whiteColor; hl.font = [UIFont systemFontOfSize:12];
     [_panel addSubview:hl];
     UISwitch *hs = [[UISwitch alloc] init];
     hs.transform = (CGAffineTransform){ 0.68, 0, 0, 0.68, 0, 0 };
-    hs.center = CGPointMake(170 + 96 + 20, 325);
+    hs.center = CGPointMake(170 + 96 + 20, 319);
     hs.tag = 9; hs.on = g_set.hp;
     [hs addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:hs];
@@ -1176,6 +1227,7 @@ static NSString *diagRenderer(void *r) {
         case 7: g_set.noocc = s.on; break;
         case 8: g_set.aim = s.on; break;
         case 9: g_set.hp = s.on; break;
+        case 12: g_set.hdot = s.on; break;
     }
     g_dirty = true; saveSettings();
 }
@@ -1255,6 +1307,9 @@ static NSString *diagRenderer(void *r) {
         _hpR.fillColor = [UIColor colorWithRed:1 green:0.15 blue:0.15 alpha:1].CGColor;
         [_overlay.layer addSublayer:_boxes]; [_overlay.layer addSublayer:_skel];
         for (CAShapeLayer *hl in @[_hpBack, _hpG, _hpY, _hpR]) { hl.strokeColor = nil; [_overlay.layer addSublayer:hl]; }
+        _hdot = [CAShapeLayer layer];
+        _hdot.strokeColor = [UIColor colorWithWhite:0 alpha:0.85].CGColor; _hdot.lineWidth = 1;
+        [_overlay.layer addSublayer:_hdot];
     }
     if (_overlay.superview != win) { [_overlay removeFromSuperview]; [win insertSubview:_overlay belowSubview:_btn]; }
 
@@ -1262,6 +1317,7 @@ static NSString *diagRenderer(void *r) {
     UIBezierPath *skelPath = [UIBezierPath bezierPath];
     UIBezierPath *hpBack = [UIBezierPath bezierPath], *hpG = [UIBezierPath bezierPath], *hpY = [UIBezierPath bezierPath], *hpR = [UIBezierPath bezierPath];
     bool wantHp = g_set.hp && g_haveHp;
+    UIBezierPath *dotPath = [UIBezierPath bezierPath];
     int drawn = 0, myTeam = -1;
     bool camOk = false;
     std::vector<void *> wantChams;
@@ -1337,6 +1393,18 @@ static NSString *diagRenderer(void *r) {
                     }
                     if (hy > -1e8f) tg.push_back(hw); else tg.push_back({ p.pos.x, p.pos.y + 1.6f, p.pos.z });
                     bool haveBones = good >= 6;
+
+                    if (g_set.hdot) {      // head dot: highest valid bone, or the pivot + box height when bones are missing
+                        V3 h3 = (hy > -1e8f) ? V3{ hw.x, hw.y + 0.04f, hw.z } : V3{ p.pos.x, p.pos.y + g_set.head - 0.12f, p.pos.z };
+                        V3 hs3 = d_world2screen(cam, h3, mi_w2s);
+                        if (hs3.z > 0) {
+                            float ddx = h3.x - camPos.x, ddy = h3.y - camPos.y, ddz = h3.z - camPos.z;
+                            float dd = fmaxf(0.5f, sqrtf(ddx * ddx + ddy * ddy + ddz * ddz));
+                            CGFloat rad = fmin(14.0, fmax(2.5, 0.11 * vs.height * 0.866 / dd));   // ~11 cm head radius at 60 deg vfov
+                            CGFloat dx2 = hs3.x / sw * vs.width, dy2 = (1.0 - hs3.y / sh) * vs.height;
+                            [dotPath appendPath:[UIBezierPath bezierPathWithOvalInRect:CGRectMake(dx2 - rad, dy2 - rad, rad * 2, rad * 2)]];
+                        }
+                    }
 
                     if (g_set.skel && haveBones) {
                         for (size_t b = 0; b < nb; b++) {
@@ -1434,6 +1502,7 @@ static NSString *diagRenderer(void *r) {
     _boxes.lineWidth = g_set.lw; _skel.lineWidth = g_set.lw;
     _boxes.path = boxPath.CGPath; _skel.path = skelPath.CGPath;
     for (CAShapeLayer *hl in @[_hpBack, _hpG, _hpY, _hpR]) hl.frame = _overlay.bounds;
+    _hdot.frame = _overlay.bounds; _hdot.path = dotPath.CGPath; _hdot.fillColor = colorFor(g_set.color, 1).CGColor;
     _hpBack.path = hpBack.CGPath; _hpG.path = hpG.CGPath; _hpY.path = hpY.CGPath; _hpR.path = hpR.CGPath;
     [CATransaction commit];
 
@@ -1445,7 +1514,12 @@ static NSString *diagRenderer(void *r) {
                         cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", sh,
                         g_chamMode == 2 ? "NO x-ray" : "x-ray", g_chams.size(), g_chamReapply,
                         g_occOff ? "off" : "on", g_occ.size()];
-        @try { _status.text = [_status.text stringByAppendingFormat:@"\n%@", (g_hpLearn || now < g_hpMsgUntil) ? g_hpMsg : ((g_learn || now < g_msgUntil) ? g_learnMsg : diagRenderer(diagR))]; } @catch (...) {}
+        @try {
+            NSString *l3 = (g_learn || now < g_msgUntil) ? g_learnMsg
+                         : (g_set.aim ? ((g_haveYaw && g_havePit) ? @"aim: ON, look fields learned" : @"aim: ON but NOT learned -> Learn look fields")
+                                      : diagRenderer(diagR));
+            _status.text = [_status.text stringByAppendingFormat:@"\n%@\n%@", l3, g_hpMsg];
+        } @catch (...) {}
     }
 }
 @end
