@@ -1,4 +1,4 @@
-// SCESP.mm v5 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.2 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -20,6 +20,7 @@
 #include <vector>
 #include <unordered_map>
 #include <ctype.h>
+#include <string>
 
 // ---- config ----------------------------------------------------------------------------
 static const char *kGameImage = "Chillow.StandChillow.Client.dll";
@@ -233,6 +234,8 @@ static void *mi_find, *mi_get_bones, *mi_get_smats, *mi_set_smats, *mi_find_shad
 static void *mi_set_color, *mi_set_queue, *mi_setint, *mi_setglobal, *mi_get_name, *mi_hasprop;
 static void *k_animator, *k_occsys;
 static void *mi_anim_cull, *mi_beh_enabled, *mi_smr_offscreen, *mi_rend_enabled, *mi_cam_occ;
+static void *mi_rend_get_enabled, *mi_rend_isvis, *mi_rend_get_froff, *mi_rend_set_froff, *mi_cam_get_occ;
+static void *mi_get_go, *mi_go_active, *mi_go_layer;
 
 static d_get_main d_cam_main;  static void *mi_cam_main;
 static d_obj_get d_tr;         static void *mi_tr;
@@ -286,6 +289,16 @@ static bool resolveAll() {
         void *cBeh = il2_class_from_name(core, "UnityEngine", "Behaviour");
         if (cBeh) mi_beh_enabled = il2_get_method(cBeh, "set_enabled", 1);
         if (cRend) mi_rend_enabled = il2_get_method(cRend, "set_enabled", 1);
+        if (cRend) {
+            mi_rend_get_enabled = il2_get_method(cRend, "get_enabled", 0);
+            mi_rend_isvis       = il2_get_method(cRend, "get_isVisible", 0);
+            mi_rend_get_froff   = il2_get_method(cRend, "get_forceRenderingOff", 0);
+            mi_rend_set_froff   = il2_get_method(cRend, "set_forceRenderingOff", 1);
+        }
+        mi_cam_get_occ = il2_get_method(cCamera, "get_useOcclusionCulling", 0);
+        mi_get_go = il2_get_method(cComp, "get_gameObject", 0);
+        { void *cGO = il2_class_from_name(core, "UnityEngine", "GameObject");
+          if (cGO) { mi_go_active = il2_get_method(cGO, "get_activeInHierarchy", 0); mi_go_layer = il2_get_method(cGO, "get_layer", 0); } }
         if (k_smr) mi_smr_offscreen = il2_get_method(k_smr, "set_updateWhenOffscreen", 1);
         mi_cam_occ = il2_get_method(cCamera, "set_useOcclusionCulling", 1);
         void *animImg = findImage("UnityEngine.AnimationModule.dll");
@@ -518,6 +531,7 @@ static void forceVisible(bool full) {
             if (alive(r)) {
                 bool t = true; void *a[1] = { &t };
                 inv(mi_rend_enabled, r, a);
+                { bool f = false; void *a2[1] = { &f }; inv(mi_rend_set_froff, r, a2); }
                 if (full) inv(mi_smr_offscreen, r, a);
             }
         }
@@ -663,6 +677,70 @@ static void reconcileChams(const std::vector<void *> &want) {
     }
 }
 
+
+// ---- class/method dump (for finding the fire path) ----------------------------------------
+// Panel button "Dump -> clipboard": every class of the game image whose name looks shooting-related,
+// with the methods that look relevant: signature + RVA (address minus image base).
+static NSString *dumpFirePath() {
+    void *game = findImage(kGameImage);
+    if (!game) return @"game image not found";
+    typedef size_t (*f_cnt)(void *);              typedef void *(*f_cls)(void *, size_t);
+    typedef const char *(*f_nm)(void *);          typedef void *(*f_ret)(void *);
+    f_cnt  imgCount = (f_cnt)dlsym(RTLD_DEFAULT, "il2cpp_image_get_class_count");
+    f_cls  imgClass = (f_cls)dlsym(RTLD_DEFAULT, "il2cpp_image_get_class");
+    f_nm   cName    = (f_nm)dlsym(RTLD_DEFAULT, "il2cpp_class_get_name");
+    f_nm   cNs      = (f_nm)dlsym(RTLD_DEFAULT, "il2cpp_class_get_namespace");
+    f_ret  mRet     = (f_ret)dlsym(RTLD_DEFAULT, "il2cpp_method_get_return_type");
+    if (!imgCount || !imgClass || !cName || !cNs || !mRet) return @"il2cpp class enumeration API missing";
+
+    static const char *clsKeys[] = { "weapon", "gun", "shoot", "fire", "bullet", "projectile", "ballistic", "hitscan", "raycast", "aim", "recoil", "damage", "firearm", "shot" };
+    static const char *mthKeys[] = { "fire", "shoot", "shot", "ray", "hit", "bullet", "aim", "spread", "recoil", "direction", "damage", "cast", "trace", "muzzle", "origin", "projectile", "attack" };
+    auto lower = [](const char *in) { std::string o; for (; in && *in; in++) o += (char)tolower(*in); return o; };
+    auto hit = [](const std::string &h, const char *const *keys, size_t n) { for (size_t i = 0; i < n; i++) if (h.find(keys[i]) != std::string::npos) return true; return false; };
+
+    NSMutableString *out = [NSMutableString string];
+    size_t total = imgCount(game);
+    int classesOut = 0;
+    for (size_t i = 0; i < total && classesOut < 80 && out.length < 60000; i++) {
+        void *k = imgClass(game, i);
+        if (!k) continue;
+        std::string cn = lower(cName(k));
+        if (!hit(cn, clsKeys, sizeof(clsKeys) / sizeof(clsKeys[0]))) continue;
+        classesOut++;
+        [out appendFormat:@"%s.%s\n", cNs(k), cName(k)];
+        void *iter = nullptr, *m; int shown = 0;
+        while ((m = il2_class_methods(k, &iter)) && shown < 40) {
+            const char *mn = il2_method_name(m);
+            if (!hit(lower(mn), mthKeys, sizeof(mthKeys) / sizeof(mthKeys[0]))) continue;
+            shown++;
+            NSMutableString *sig = [NSMutableString string];
+            uint32_t pc = il2_method_pcount(m);
+            for (uint32_t p = 0; p < pc; p++) { const char *tn = il2_type_name(il2_method_param(m, p)); [sig appendFormat:@"%s%s", p ? ", " : "", tn ? tn : "?"]; }
+            const char *rn = il2_type_name(mRet(m));
+            void *fp = direct(m); Dl_info di; long rva = 0;
+            if (fp && dladdr(fp, &di)) rva = (long)((char *)fp - (char *)di.dli_fbase);
+            [out appendFormat:@"  %s %s(%@)  rva=0x%lx\n", rn ? rn : "?", mn, sig, rva];
+        }
+    }
+    return out.length ? out : @"nothing matched";
+}
+
+static bool unboxBool(void *b) { return b ? *(bool *)((char *)b + 16) : false; }
+static int unboxInt(void *b) { return b ? *(int *)((char *)b + 16) : -1; }
+// state of one enemy body renderer, as the engine sees it right now
+static NSString *diagRenderer(void *r) {
+    if (!r || !alive(r)) return @"diag: -";
+    int en = mi_rend_get_enabled ? unboxBool(inv(mi_rend_get_enabled, r, nullptr)) : -1;
+    int vis = mi_rend_isvis ? unboxBool(inv(mi_rend_isvis, r, nullptr)) : -1;
+    int fo = mi_rend_get_froff ? unboxBool(inv(mi_rend_get_froff, r, nullptr)) : -1;
+    int act = -1, layer = -1;
+    void *go = mi_get_go ? inv(mi_get_go, r, nullptr) : nullptr;
+    if (go) { act = mi_go_active ? unboxBool(inv(mi_go_active, go, nullptr)) : -1; layer = mi_go_layer ? unboxInt(inv(mi_go_layer, go, nullptr)) : -1; }
+    void *cam = d_cam_main(mi_cam_main);
+    int co = (cam && mi_cam_get_occ) ? unboxBool(inv(mi_cam_get_occ, cam, nullptr)) : -1;
+    return [NSString stringWithFormat:@"diag enemy0: enabled %d | visible %d | forceOff %d | active %d | layer %d | camOcc %d", en, vis, fo, act, layer, co];
+}
+
 // ---- UI --------------------------------------------------------------------------------
 @interface SCESPDriver : NSObject
 - (void)tick;
@@ -676,6 +754,7 @@ static void reconcileChams(const std::vector<void *> &want) {
     UILabel *_status;
     UILabel *_lwLabel, *_hdLabel;
     int _frame, _vfy;
+    void *_diagR;
     double _lastTick, _lastScan;
 }
 
@@ -701,7 +780,7 @@ static void reconcileChams(const std::vector<void *> &want) {
 }
 
 - (void)buildPanel {
-    _panel = [[UIView alloc] initWithFrame:CGRectMake(8, 72, 330, 268)];
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(8, 72, 330, 312)];
     _panel.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
     _panel.layer.cornerRadius = 10;
     _panel.hidden = YES;
@@ -748,11 +827,18 @@ static void reconcileChams(const std::vector<void *> &want) {
     [s2 addTarget:self action:@selector(slChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:s2];
 
-    _status = [[UILabel alloc] initWithFrame:CGRectMake(10, 224, 310, 38)];
+    _status = [[UILabel alloc] initWithFrame:CGRectMake(10, 224, 310, 50)];
     _status.textColor = [UIColor colorWithWhite:0.8 alpha:1];
     _status.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
-    _status.numberOfLines = 3;
+    _status.numberOfLines = 4;
     [_panel addSubview:_status];
+    UIButton *db = [UIButton buttonWithType:UIButtonTypeCustom];
+    db.frame = CGRectMake(10, 280, 310, 26);
+    db.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1]; db.layer.cornerRadius = 6;
+    db.titleLabel.font = [UIFont systemFontOfSize:12];
+    [db setTitle:@"Dump fire-path classes -> clipboard" forState:UIControlStateNormal];
+    [db addTarget:self action:@selector(dumpTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_panel addSubview:db];
     [self refreshLabels];
 }
 
@@ -794,6 +880,13 @@ static void reconcileChams(const std::vector<void *> &want) {
     [self refreshLabels]; saveSettings();
 }
 - (void)plateTapped { _panel.hidden = !_panel.hidden; }
+- (void)dumpTapped {
+    if (!g_ready) { _status.text = @"dump: game not ready yet"; return; }
+    NSString *d = dumpFirePath();
+    UIPasteboard.generalPasteboard.string = d;
+    NSLog(@"[SCESP] dump (%lu chars) copied to clipboard\n%@", (unsigned long)d.length, d);
+    _status.text = [NSString stringWithFormat:@"dump copied: %lu chars", (unsigned long)d.length];
+}
 
 // Called from a run-loop observer that fires AFTER Unity's frame callback, so bone and camera
 // transforms are the ones of the frame that was just rendered (no one-frame lag).
@@ -845,6 +938,7 @@ static void reconcileChams(const std::vector<void *> &want) {
     bool camOk = false;
     std::vector<void *> wantChams;
     bool scanNow = false;
+    void *diagR = nullptr;
 
     if (g_set.on) {
         if (now - _lastScan > 1.0) { rescan(g_set.skel || g_set.chams || g_set.box); scanNow = true; _lastScan = now; }
@@ -953,6 +1047,7 @@ static void reconcileChams(const std::vector<void *> &want) {
         } @catch (...) {}
     }
 
+    if (!wantChams.empty()) diagR = wantChams[0];
     if (g_dirty || scanNow || !g_set.on) {
         @try {
             if (!g_set.on || !g_set.chams) wantChams.clear();
@@ -982,6 +1077,7 @@ static void reconcileChams(const std::vector<void *> &want) {
                         cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", sh,
                         g_chamMode == 2 ? "NO x-ray" : "x-ray", g_chams.size(), g_chamReapply,
                         g_occOff ? "off" : "on", g_occ.size()];
+        @try { _status.text = [_status.text stringByAppendingFormat:@"\n%@", diagRenderer(diagR)]; } @catch (...) {}
     }
 }
 @end
