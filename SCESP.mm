@@ -254,6 +254,19 @@ static void *inv(void *mi, void *obj, void **args) {
 }
 
 // ---- resolved state --------------------------------------------------------------------
+// health may live on a sibling component, not on PlayerController: root 0 = the player class, others below
+struct HpRoot { const char *ns, *name; };
+static const HpRoot kHpRootDefs[] = {
+    { nullptr, nullptr },
+    { "Chillow.StandChillow.Player.Hit", "PlayerHitController" },
+    { "Chillow.StandChillow.Player.Hit", "HitController" },
+    { "Chillow.StandChillow.Player.Hit", "DummyHitController" },
+    { "Chillow.StandChillow.Player", "NetworkController" },
+    { "Chillow.StandChillow.Player", "CharacterPlayer" },
+};
+static const int kHpRoots = 6;
+static void *k_hpRoot[kHpRoots];
+static bool g_hpRoots = false;          // rescan() also collects the root components per player
 static void *k_targets[8];
 static size_t g_counts[8];
 static int g_active = -1;
@@ -362,6 +375,7 @@ static bool resolveAll() {
 
     for (int i = 0; i < kN; i++) k_targets[i] = il2_class_from_name(game, kTargets[i].ns, kTargets[i].name);
     k_aim = il2_class_from_name(game, "Chillow.StandChillow.Player.Aim", "AimController");
+    for (int r = 1; r < kHpRoots; r++) k_hpRoot[r] = il2_class_from_name(game, kHpRootDefs[r].ns, kHpRootDefs[r].name);
     if (il2_resolve_icall) {
         auto ic = [](const char *a, const char *b) -> void * { void *p = il2_resolve_icall(a); return p ? p : il2_resolve_icall(b); };
         ic_cam_set_occ   = (ic_set_bool)ic("UnityEngine.Camera::set_useOcclusionCulling(System.Boolean)", "UnityEngine.Camera::set_useOcclusionCulling");
@@ -609,25 +623,37 @@ static void probeStep(void *me, void *aim, float cy, float cp, double now) {
         g_probePhase = 1; g_probeT0 = now;
         return;
     }
-    if (now - g_probeT0 < 0.25) return;
     float d = g_probeAxis == 0 ? wrap180(cy - g_probeStart) : cp - g_probeStart;
-    bool drives = d > 2.0f && d < 6.5f;
-    if (drives) {
-        if (g_probeAxis == 0) { g_yawC = pc.c; g_yawK = pc.k; g_haveYaw = true; g_probeOkY = true; }
-        else                  { g_pitC = pc.c; g_pitK = pc.k; g_havePit = true; g_probeOkP = true; }
-        if (g_report) [g_report appendFormat:@"== DRIVER %s: %@ off=%d/%d k=%.4f moved=%.2f\n", g_probeAxis ? "pitch" : "yaw", candName(pc.c), pc.c.off, pc.c.off2, pc.k, d];
-        g_probeIdx = list.size();               // axis solved
+    bool inWin = d > 2.0f && d < 6.5f;
+    if (g_probePhase == 1) {
+        if (now - g_probeT0 < 0.25) return;
+        if (inWin) { g_probePhase = 2; return; }        // turned: now check that it STAYS turned
     } else {
-        if (g_report) [g_report appendFormat:@"   mirror/no effect: %@ (moved %.2f)\n", candName(pc.c), d];
-        *a = g_probeOrig;
-        g_probeIdx++;
+        if (now - g_probeT0 < 0.9) return;
+        if (inWin) {
+            float kc = pc.k * 4.0f / d;                  // field units per degree actually achieved
+            if (g_probeAxis == 0) { g_yawC = pc.c; g_yawK = kc; g_haveYaw = true; g_probeOkY = true; }
+            else                  { g_pitC = pc.c; g_pitK = kc; g_havePit = true; g_probeOkP = true; }
+            if (g_report) [g_report appendFormat:@"== DRIVER %s: %@ off=%d/%d k=%.4f (regress %.4f) moved=%.2f\n", g_probeAxis ? "pitch" : "yaw", candName(pc.c), pc.c.off, pc.c.off2, kc, pc.k, d];
+            g_probeIdx = list.size();                    // axis solved
+            g_probePhase = 0;
+            return;
+        }
     }
+    if (g_report) [g_report appendFormat:@"   rejected: %@ (moved %.2f, phase %d)\n", candName(pc.c), d, g_probePhase];
+    *a = g_probeOrig;                                    // mirror, no effect, or a decaying offset
+    g_probeIdx++;
     g_probePhase = 0;
 }
+static double g_aimLastW = 0;
+static float g_aimLwY = 0, g_aimLwP = 0;
 static void aimStep(void *me, void *aim, float dyaw, float dpit) {
     float *py = candAddr(g_yawC, me, aim), *pp = candAddr(g_pitC, me, aim);
-    if (py) *py += g_yawK * dyaw * 0.5f;
-    if (pp) *pp += g_pitK * dpit * 0.5f;
+    dyaw = fmaxf(-8.f, fminf(8.f, dyaw)); dpit = fmaxf(-8.f, fminf(8.f, dpit));
+    if (fabsf(dyaw) < 0.12f) dyaw = 0;
+    if (fabsf(dpit) < 0.12f) dpit = 0;
+    if (py) *py += g_yawK * dyaw * 0.35f;
+    if (pp) *pp += g_pitK * dpit * 0.35f;
 }
 
 // ---- scene scan ------------------------------------------------------------------------
@@ -639,6 +665,7 @@ struct PlayerInfo {
     uint32_t body = 0;              // the SMR with the most bones = third-person body (not FP arms)
     std::vector<uint32_t> bone;     // Transform handles (biggest SMR's bones)
     std::vector<int> parent;        // parent index inside `bone`, or -1
+    std::vector<uint32_t> hproot;   // handles of hit / network components of this player (health search), index = root id
 };
 static std::vector<PlayerInfo> g_pl;
 
@@ -671,6 +698,7 @@ static void freeInfo(PlayerInfo &p) {
     for (uint32_t h : p.anim) il2_gc_free(h);
     if (p.body) il2_gc_free(p.body);
     for (uint32_t h : p.bone) il2_gc_free(h);
+    for (uint32_t h : p.hproot) if (h) il2_gc_free(h);
 }
 
 static size_t findObjs(void *klass, std::vector<void *> &out, size_t cap) {
@@ -736,6 +764,15 @@ static void rescan(bool wantBones) {
             findObjs(k_animator, anims, 512);
             for (void *an : anims) { int o = ownerOf(an); if (o >= 0) animsOf[o].push_back(an); }
         }
+        if (g_hpRoots) {
+            for (size_t i = 0; i < objs.size(); i++) fresh[i].hproot.assign(kHpRoots, 0);
+            for (int r = 1; r < kHpRoots; r++) {
+                if (!k_hpRoot[r]) continue;
+                std::vector<void *> ro;
+                findObjs(k_hpRoot[r], ro, 128);
+                for (void *x : ro) { int o = ownerOf(x); if (o >= 0 && !fresh[o].hproot[r]) fresh[o].hproot[r] = il2_gc_new(x, 0); }
+            }
+        }
         for (size_t i = 0; i < objs.size(); i++) {
             void *best = nullptr, *bestSmr = nullptr; uintptr_t bestN = 0;
             for (void *smr : mine[i]) {
@@ -772,15 +809,16 @@ static void rescan(bool wantBones) {
 // ---- health bar ------------------------------------------------------------------------
 // The game uses Anti-Cheat Toolkit, so health is most likely an ObscuredFloat / ObscuredInt (XOR-ed
 // storage). Those are read by calling the game's own op_Implicit, i.e. exactly what its code does.
-// Candidates = float / int / ObscuredFloat / ObscuredInt instance fields of the player class and of
-// Chillow.* classes reachable through up to two reference hops (inline structs are followed too).
+// Candidates = float / int / ObscuredFloat / ObscuredInt instance fields of the player class AND of the
+// hit / network components that sit on the same character (roots), reachable through up to two
+// reference hops (inline structs are followed too).
 // Learn: snapshot all characters, user damages one, compare: the right field dropped on exactly one
 // character and did not move on any other.
 static const char *kObsF = "CodeStage.AntiCheat.ObscuredTypes.ObscuredFloat";
 static const char *kObsI = "CodeStage.AntiCheat.ObscuredTypes.ObscuredInt";
-struct HCand { uint8_t kind, nd; int off[3]; const char *n1, *n2; };   // kind 0 float, 1 int, 2 ObscuredFloat, 3 ObscuredInt
+struct HCand { uint8_t kind, nd, root; int off[3]; const char *n1, *n2; };   // kind 0 float, 1 int, 2 ObscuredFloat, 3 ObscuredInt
 static std::vector<HCand> g_hc;
-static HCand g_hpC = { 0, 0, { 0, 0, 0 }, nullptr, nullptr };
+static HCand g_hpC = { 0, 0, 0, { 0, 0, 0 }, nullptr, nullptr };
 static bool g_haveHp = false;
 static int g_hpLearn = 0;                 // 0 idle, 1 snapshot taken (waiting for the hit)
 static float g_hpRef = 0;                 // "full health" reference = highest value seen on the learned field
@@ -789,6 +827,7 @@ static double g_hpMsgUntil = 0;
 static std::unordered_map<void *, std::vector<float>> g_hpSnap;
 static void *mi_obsF, *mi_obsI;
 static size_t g_hcObs = 0;
+static int g_scanRoot = 0;
 
 // finds ObscuredFloat / ObscuredInt in whatever assembly holds ACTk and resolves their implicit conversions
 static bool g_obsTried = false;
@@ -807,8 +846,17 @@ static void ensureObs() {
     }
     NSLog(@"[SCESP] obscured: float op=%p int op=%p", mi_obsF, mi_obsI);
 }
-static bool readCand(const HCand &c, void *obj, float &out) {
-    char *o = (char *)obj;
+static PlayerInfo *piFor(void *obj) {
+    for (auto &pi : g_pl) if (il2_gc_get(pi.obj) == obj) return &pi;
+    return nullptr;
+}
+static bool readCand(const HCand &c, void *playerObj, PlayerInfo *pi, float &out) {
+    char *o = (char *)playerObj;
+    if (c.root) {
+        if (!pi || c.root >= pi->hproot.size() || !pi->hproot[c.root]) return false;
+        o = (char *)il2_gc_get(pi->hproot[c.root]);
+        if (!o || !alive(o)) return false;
+    }
     if (!o) return false;
     for (int i = 0; i < c.nd; i++) { o = *(char **)(o + c.off[i]); if (!o) return false; }
     char *addr = o + c.off[c.nd];
@@ -831,7 +879,7 @@ static bool readCand(const HCand &c, void *obj, float &out) {
 }
 static NSString *hpName(const HCand &c) {
     static const char *kn[] = { "float", "int", "obsF", "obsI" };
-    return [NSString stringWithFormat:@"%s %s%s%s nd=%d off=%d/%d/%d", kn[c.kind & 3], c.n1 ? c.n1 : "", c.n1 ? "." : "", c.n2 ? c.n2 : "?", c.nd, c.off[0], c.off[1], c.off[2]];
+    return [NSString stringWithFormat:@"r%d %s %s%s%s nd=%d off=%d/%d/%d", c.root, kn[c.kind & 3], c.n1 ? c.n1 : "", c.n1 ? "." : "", c.n2 ? c.n2 : "?", c.nd, c.off[0], c.off[1], c.off[2]];
 }
 static void scanHpClass(void *klass, int nd, const int *path, int adj, int inl, const char *hop) {
     for (void *k = klass; k; k = il2_class_parent(k)) {
@@ -853,8 +901,8 @@ static void scanHpClass(void *klass, int nd, const int *path, int adj, int inl, 
                 if (kind == 2 && !mi_obsF && il2_class_from_type) { void *ok = il2_class_from_type(ft); if (ok) mi_obsF = findMethod(ok, "op_Implicit", 1, kObsF); }
                 if (kind == 3 && !mi_obsI && il2_class_from_type) { void *ok = il2_class_from_type(ft); if (ok) mi_obsI = findMethod(ok, "op_Implicit", 1, kObsI); }
                 if ((kind == 2 && !mi_obsF) || (kind == 3 && !mi_obsI)) continue;
-                if (g_hc.size() >= 30000) continue;
-                HCand c; c.kind = (uint8_t)kind; c.nd = (uint8_t)nd; c.n1 = hop; c.n2 = fn;
+                if (g_hc.size() >= 60000) continue;
+                HCand c; c.kind = (uint8_t)kind; c.nd = (uint8_t)nd; c.root = (uint8_t)g_scanRoot; c.n1 = hop; c.n2 = fn;
                 c.off[0] = c.off[1] = c.off[2] = 0;
                 for (int i = 0; i < nd; i++) c.off[i] = path[i];
                 c.off[nd] = off;
@@ -871,15 +919,15 @@ static void scanHpClass(void *klass, int nd, const int *path, int adj, int inl, 
 }
 static void saveHp() {
     if (!g_haveHp) return;
-    [NSUserDefaults.standardUserDefaults setObject:@[@(g_hpC.kind), @(g_hpC.nd), @(g_hpC.off[0]), @(g_hpC.off[1]), @(g_hpC.off[2]), @(g_hpRef)] forKey:@"scesp_hpc2"];
+    [NSUserDefaults.standardUserDefaults setObject:@[@(g_hpC.kind), @(g_hpC.nd), @(g_hpC.off[0]), @(g_hpC.off[1]), @(g_hpC.off[2]), @(g_hpC.root), @(g_hpRef)] forKey:@"scesp_hpc3"];
 }
 static void loadHp() {
-    NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:@"scesp_hpc2"];
-    if (a.count != 6) return;
+    NSArray *a = [NSUserDefaults.standardUserDefaults arrayForKey:@"scesp_hpc3"];
+    if (a.count != 7) return;
     g_hpC.kind = [a[0] intValue]; g_hpC.nd = [a[1] intValue];
     g_hpC.off[0] = [a[2] intValue]; g_hpC.off[1] = [a[3] intValue]; g_hpC.off[2] = [a[4] intValue];
-    g_hpRef = [a[5] floatValue]; g_haveHp = true; g_hpMsg = @"hp: learned field loaded";
-    // the method pointers for Obscured* are resolved lazily by the first learn; until then obscured fields read as "no value"
+    g_hpC.root = [a[5] intValue];
+    g_hpRef = [a[6] floatValue]; g_haveHp = true; g_hpRoots = g_hpC.root > 0; g_hpMsg = @"hp: learned field loaded";
 }
 static void hpSay(NSString *m, double secs) { g_hpMsg = m; g_hpMsgUntil = CACurrentMediaTime() + secs; NSLog(@"[SCESP] %@", m); }
 
@@ -887,30 +935,42 @@ static void hpSay(NSString *m, double secs) { g_hpMsg = m; g_hpMsgUntil = CACurr
 static bool hpLearnTap() {
     if (g_hpLearn == 0) {
         if (g_active < 0 || !k_targets[g_active]) { hpSay(@"hp: no player class yet", 5); return false; }
+        g_hpRoots = true;
+        rescan(true);                                     // collect the hit / network components per player now
         ensureObs();
         g_hc.clear(); g_hpSnap.clear(); g_hcObs = 0;
         int path[3] = { 0, 0, 0 };
-        scanHpClass(k_targets[g_active], 0, path, 0, 0, nullptr);
+        int rootsUsed = 0;
+        for (int r = 0; r < kHpRoots; r++) {
+            void *kl = r == 0 ? k_targets[g_active] : k_hpRoot[r];
+            if (!kl) continue;
+            if (r > 0) { bool any = false; for (auto &pi : g_pl) if (r < (int)pi.hproot.size() && pi.hproot[r]) { any = true; break; } if (!any) continue; rootsUsed++; }
+            g_scanRoot = r;
+            scanHpClass(kl, 0, path, 0, 0, nullptr);
+        }
         for (auto &pi : g_pl) {
             void *o = il2_gc_get(pi.obj);
             if (!alive(o)) continue;
             std::vector<float> v(g_hc.size(), NAN);
-            for (size_t i = 0; i < g_hc.size(); i++) { float x; if (readCand(g_hc[i], o, x)) v[i] = x; }
+            for (size_t i = 0; i < g_hc.size(); i++) { float x; if (readCand(g_hc[i], o, &pi, x)) v[i] = x; }
             g_hpSnap[o] = std::move(v);
         }
         if (g_hpSnap.size() < 2) { hpSay(@"hp: need 2+ characters in the scene", 6); return false; }
         g_hpLearn = 1;
-        hpSay([NSString stringWithFormat:@"hp: %zuf %zuobs - hit 1 enemy, tap", g_hc.size(), g_hcObs], 600);
+        hpSay([NSString stringWithFormat:@"hp: %zuf %zuobs R%d - hit 1 enemy, tap", g_hc.size(), g_hcObs, rootsUsed], 600);
         return true;
     }
     g_hpLearn = 0;
+    std::unordered_map<void *, PlayerInfo *> pim;
+    for (auto &pi : g_pl) pim[il2_gc_get(pi.obj)] = &pi;
     int best = -1, bestScore = -1; size_t matches = 0; float bestBefore = 0;
     for (size_t i = 0; i < g_hc.size(); i++) {
         int dec = 0; bool bad = false; float before = 0;
         for (auto &kv : g_hpSnap) {
             if (!alive(kv.first)) continue;
             float b = kv.second[i], a;
-            if (b != b || !readCand(g_hc[i], kv.first, a)) continue;
+            auto it = pim.find(kv.first);
+            if (b != b || !readCand(g_hc[i], kv.first, it == pim.end() ? nullptr : it->second, a)) continue;
             float d = a - b;
             if (d < -0.5f && b > 0.5f && b < 100000.f && a >= -1.f) { dec++; before = b; }
             else if (fabsf(d) > 0.001f) { bad = true; break; }
@@ -924,12 +984,14 @@ static bool hpLearnTap() {
     if (best < 0) {
         // report: everything that dropped on at least one character, to see what the game really changed
         NSMutableString *rp = [NSMutableString stringWithFormat:@"hp learn FAILED: cands=%zu obs=%zu chars=%zu\n", g_hc.size(), g_hcObs, g_hpSnap.size()];
+        for (int r = 1; r < kHpRoots; r++) { int n = 0; for (auto &pi : g_pl) if (r < (int)pi.hproot.size() && pi.hproot[r]) n++; [rp appendFormat:@"root %d (%s): on %d players\n", r, kHpRootDefs[r].name, n]; }
         int shown = 0;
         for (size_t i = 0; i < g_hc.size() && shown < 40; i++) {
             for (auto &kv : g_hpSnap) {
                 if (!alive(kv.first)) continue;
                 float b = kv.second[i], a;
-                if (b != b || !readCand(g_hc[i], kv.first, a)) continue;
+                auto it = pim.find(kv.first);
+                if (b != b || !readCand(g_hc[i], kv.first, it == pim.end() ? nullptr : it->second, a)) continue;
                 if (a - b < -0.001f) { [rp appendFormat:@"%@  %.2f -> %.2f\n", hpName(g_hc[i]), b, a]; shown++; break; }
             }
         }
@@ -939,13 +1001,13 @@ static bool hpLearnTap() {
         g_hpSnap.clear();
         return false;
     }
-    g_hpC = g_hc[best]; g_haveHp = true;
+    g_hpC = g_hc[best]; g_haveHp = true; g_hpRoots = g_hpC.root > 0;
     float ref = bestBefore;
     for (auto &kv : g_hpSnap) if (kv.second[best] == kv.second[best] && kv.second[best] > ref) ref = kv.second[best];
     g_hpRef = ref;
     saveHp();
     UIPasteboard.generalPasteboard.string = hpName(g_hpC);
-    hpSay([NSString stringWithFormat:@"hp OK %s full=%.0f (%zu match)", g_hpC.kind >= 2 ? "obscured" : (g_hpC.kind ? "int" : "float"), g_hpRef, matches], 10);
+    hpSay([NSString stringWithFormat:@"hp OK r%d %s full=%.0f (%zu)", g_hpC.root, g_hpC.kind >= 2 ? "obscured" : (g_hpC.kind ? "int" : "float"), g_hpRef, matches], 10);
     g_hpSnap.clear();
     return false;
 }
@@ -1585,7 +1647,7 @@ static NSString *diagRenderer(void *r) {
                         }
                         if (g_set.box || g_set.fill) [boxPath appendPath:[UIBezierPath bezierPathWithRect:r]];
                         float hv;
-                        if (wantHp && readCand(g_hpC, p.obj, hv) && hv > 0.f && hv < 1e6f) {
+                        if (wantHp && readCand(g_hpC, p.obj, &pi, hv) && hv > 0.f && hv < 1e6f) {
                             if (hv > g_hpRef) g_hpRef = hv;
                             CGFloat ratio = fminf(1.f, hv / g_hpRef);
                             CGFloat bw = fmax(3.0, g_set.lw * 2), bx = r.origin.x - bw - 3;
@@ -1619,7 +1681,11 @@ static NSString *diagRenderer(void *r) {
                             float e = sqrtf(ey * ey + ep * ep);
                             if (e < best) { best = e; dyB = ey; dpB = ep; got = true; }
                         }
-                        if (got) aimStep(meObj, aimObj, dyB, dpB);
+                        bool camMoved = fabsf(wrap180(curYaw - g_aimLwY)) > 0.02f || fabsf(curPit - g_aimLwP) > 0.02f;
+                        if (got && now - g_aimLastW > 0.025 && (camMoved || now - g_aimLastW > 0.12)) {
+                            aimStep(meObj, aimObj, dyB, dpB);
+                            g_aimLastW = now; g_aimLwY = curYaw; g_aimLwP = curPit;
+                        }
                     }
                 }
             }
