@@ -31,11 +31,11 @@ static const int   kN = sizeof(kTargets) / sizeof(kTargets[0]);
 static const char *kTeamType = "Chillow.StandChillow.Core.Team";   // None=0 Tr=1 Ct=2 Spectator=3
 static const float kSelfRadius = 0.7f;
 static const int   kRefreshTicks = 30;
-static const char *kChamShaders[] = { "Hidden/Internal-Colored", "Unlit/Color", "Sprites/Default" };
+static const char *kChamShaders[] = { "Hidden/Internal-Colored", "UI/Default", "Sprites/Default" };
 
 // ---- settings --------------------------------------------------------------------------
 struct Settings {
-    bool on = true, box = true, skel = true, chams = false, fill = false, team = false;
+    bool on = true, box = true, skel = true, chams = false, fill = false, team = false, lowcpu = false;
     int color = 0;
     float lw = 1.5f;
     float head = 1.8f;
@@ -59,6 +59,7 @@ static void saveSettings() {
     [d setBool:g_set.on forKey:@"scesp_on"];       [d setBool:g_set.box forKey:@"scesp_box"];
     [d setBool:g_set.skel forKey:@"scesp_skel"];   [d setBool:g_set.chams forKey:@"scesp_chams"];
     [d setBool:g_set.fill forKey:@"scesp_fill"];   [d setBool:g_set.team forKey:@"scesp_team"];
+    [d setBool:g_set.lowcpu forKey:@"scesp_low"];
     [d setInteger:g_set.color forKey:@"scesp_color"];
     [d setFloat:g_set.lw forKey:@"scesp_lw"];      [d setFloat:g_set.head forKey:@"scesp_head"];
 }
@@ -68,6 +69,7 @@ static void loadSettings() {
     g_set.on = [d boolForKey:@"scesp_on"];         g_set.box = [d boolForKey:@"scesp_box"];
     g_set.skel = [d boolForKey:@"scesp_skel"];     g_set.chams = [d boolForKey:@"scesp_chams"];
     g_set.fill = [d boolForKey:@"scesp_fill"];     g_set.team = [d boolForKey:@"scesp_team"];
+    g_set.lowcpu = [d boolForKey:@"scesp_low"];
     g_set.color = (int)[d integerForKey:@"scesp_color"];
     g_set.lw = [d floatForKey:@"scesp_lw"];        g_set.head = [d floatForKey:@"scesp_head"];
     if (g_set.lw < 0.5f) g_set.lw = 1.5f;
@@ -214,7 +216,7 @@ static int g_teamField = -1;
 
 static void *k_smr, *k_material, *k_shader;
 static void *mi_find, *mi_get_bones, *mi_get_smats, *mi_set_smats, *mi_find_shader, *mi_mat_ctor;
-static void *mi_set_color, *mi_set_queue, *mi_setint;
+static void *mi_set_color, *mi_set_queue, *mi_setint, *mi_setglobal;
 
 static d_get_main d_cam_main;  static void *mi_cam_main;
 static d_obj_get d_tr;         static void *mi_tr;
@@ -267,7 +269,10 @@ static bool resolveAll() {
         mi_get_smats = il2_get_method(cRend, "get_sharedMaterials", 0);
         mi_set_smats = il2_get_method(cRend, "set_sharedMaterials", 1);
     }
-    if (k_shader)   mi_find_shader = findMethod(k_shader, "Find", 1, "System.String");
+    if (k_shader) {
+        mi_find_shader = findMethod(k_shader, "Find", 1, "System.String");
+        mi_setglobal   = findMethod(k_shader, "SetGlobalFloat", 2, "System.String");
+    }
     if (k_material) {
         mi_mat_ctor  = findMethod(k_material, ".ctor", 1, "UnityEngine.Shader");
         mi_set_color = il2_get_method(k_material, "set_color", 1);
@@ -403,6 +408,8 @@ static std::vector<Cham> g_chams;
 static uint32_t g_chamMat = 0;
 static const char *g_chamShaderUsed = nullptr;
 static bool g_chamFailed = false;
+static int g_chamMode = 2;          // 0 = shader has _ZTest, 1 = UI/Default via unity_GUIZTestMode, 2 = no x-ray
+static uint32_t g_ztName = 0;
 
 static void setMatInt(void *mat, const char *name, int v) {
     void *s = il2_string_new(name);
@@ -433,10 +440,22 @@ static bool ensureChamMaterial() {
     void *cargs[1] = { shader };
     if (!mat || (inv(mi_mat_ctor, mat, cargs), false)) { g_chamFailed = true; return false; }
     g_chamMat = il2_gc_new(mat, 0);
-    if (mi_setint) { setMatInt(mat, "_ZTest", 8); setMatInt(mat, "_ZWrite", 0); setMatInt(mat, "_Cull", 0); }
+    if (strcmp(g_chamShaderUsed, "Hidden/Internal-Colored") == 0) g_chamMode = 0;
+    else if (strcmp(g_chamShaderUsed, "UI/Default") == 0 && mi_setglobal) g_chamMode = 1;
+    else g_chamMode = 2;
+    if (g_chamMode == 0 && mi_setint) { setMatInt(mat, "_ZTest", 8); setMatInt(mat, "_ZWrite", 0); setMatInt(mat, "_Cull", 0); }
     if (mi_set_queue) { int q = 3500; void *a[1] = { &q }; inv(mi_set_queue, mat, a); }
     updateChamColor();
     return true;
+}
+// UI/Default reads its ZTest from the global unity_GUIZTestMode; keep it on "Always" while chams are live
+static void pumpChamZTest() {
+    if (g_chamMode != 1 || !mi_setglobal || g_chams.empty()) return;
+    if (!g_ztName) g_ztName = il2_gc_new(il2_string_new("unity_GUIZTestMode"), 0);
+    void *nm = il2_gc_get(g_ztName);
+    float v = 8.0f;
+    void *args[2] = { nm, &v };
+    inv(mi_setglobal, nullptr, args);
 }
 static void restoreCham(Cham &c) {
     void *r = il2_gc_get(c.rend), *orig = il2_gc_get(c.orig);
@@ -476,7 +495,7 @@ static void reconcileChams(const std::vector<void *> &want) {
 
 // ---- UI --------------------------------------------------------------------------------
 @interface SCESPDriver : NSObject
-- (void)tick:(CADisplayLink *)link;
+- (void)tick;
 @end
 
 @implementation SCESPDriver {
@@ -486,8 +505,8 @@ static void reconcileChams(const std::vector<void *> &want) {
     UIView *_panel;
     UILabel *_status;
     UILabel *_lwLabel, *_hdLabel;
-    int _frame, _tick;
-    bool _needRecon;
+    int _frame;
+    double _lastTick, _lastScan;
 }
 
 - (UIWindow *)keyWindow {
@@ -498,49 +517,67 @@ static void reconcileChams(const std::vector<void *> &want) {
     return UIApplication.sharedApplication.windows.firstObject;
 }
 
-- (void)addRow:(NSString *)title y:(CGFloat)y tag:(int)tag on:(BOOL)on {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, y, 160, 26)];
-    l.text = title; l.textColor = UIColor.whiteColor; l.font = [UIFont systemFontOfSize:13];
-    UISwitch *s = [[UISwitch alloc] initWithFrame:CGRectMake(170, y, 0, 0)];
-    s.transform = (CGAffineTransform){ 0.7, 0, 0, 0.7, 0, 0 };
+- (void)addSwitch:(NSString *)title col:(int)col row:(int)row tag:(int)tag on:(BOOL)on {
+    CGFloat cx = col ? 170 : 10, y = 30 + row * 28;
+    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(cx, y, 96, 26)];
+    l.text = title; l.textColor = UIColor.whiteColor; l.font = [UIFont systemFontOfSize:12];
+    l.adjustsFontSizeToFitWidth = YES; l.minimumScaleFactor = 0.7;
+    UISwitch *s = [[UISwitch alloc] init];
+    s.transform = (CGAffineTransform){ 0.68, 0, 0, 0.68, 0, 0 };
+    s.center = CGPointMake(cx + 96 + 20, y + 13);
     s.tag = tag; s.on = on;
     [s addTarget:self action:@selector(swChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:l]; [_panel addSubview:s];
 }
 
 - (void)buildPanel {
-    _panel = [[UIView alloc] initWithFrame:CGRectMake(8, 72, 240, 330)];
-    _panel.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.88];
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(8, 72, 330, 268)];
+    _panel.backgroundColor = [UIColor colorWithWhite:0.05 alpha:0.9];
     _panel.layer.cornerRadius = 10;
     _panel.hidden = YES;
-    CGFloat y = 10;
-    NSArray *names = @[@"ESP", @"Box", @"Skeleton", @"Chams", @"Box fill", @"Show teammates"];
-    bool vals[6] = { g_set.on, g_set.box, g_set.skel, g_set.chams, g_set.fill, g_set.team };
-    for (int i = 0; i < 6; i++) { [self addRow:names[i] y:y tag:i on:vals[i]]; y += 30; }
-    y += 4;
+
+    UILabel *hd = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 330, 26)];
+    hd.text = @"  \u2630  ESP settings  (drag here to move)";
+    hd.textColor = UIColor.whiteColor; hd.font = [UIFont boldSystemFontOfSize:12];
+    hd.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
+    hd.userInteractionEnabled = YES;
+    hd.layer.cornerRadius = 10; hd.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+    hd.clipsToBounds = YES;
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panMoved:)];
+    [hd addGestureRecognizer:pan];
+    [_panel addSubview:hd];
+
+    [self addSwitch:@"ESP" col:0 row:0 tag:0 on:g_set.on];
+    [self addSwitch:@"Box" col:1 row:0 tag:1 on:g_set.box];
+    [self addSwitch:@"Skeleton" col:0 row:1 tag:2 on:g_set.skel];
+    [self addSwitch:@"Chams" col:1 row:1 tag:3 on:g_set.chams];
+    [self addSwitch:@"Box fill" col:0 row:2 tag:4 on:g_set.fill];
+    [self addSwitch:@"Teammates" col:1 row:2 tag:5 on:g_set.team];
+    [self addSwitch:@"Low CPU" col:0 row:3 tag:6 on:g_set.lowcpu];
+
     UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"R", @"G", @"C", @"Y", @"W", @"M", @"O"]];
-    seg.frame = CGRectMake(12, y, 216, 28);
+    seg.frame = CGRectMake(10, 148, 310, 26);
     seg.selectedSegmentIndex = g_set.color;
     [seg addTarget:self action:@selector(segChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:seg];
-    y += 38;
-    _lwLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, y, 216, 16)];
-    _lwLabel.textColor = UIColor.whiteColor; _lwLabel.font = [UIFont systemFontOfSize:11];
+
+    _lwLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 180, 150, 14)];
+    _lwLabel.textColor = UIColor.whiteColor; _lwLabel.font = [UIFont systemFontOfSize:10];
     [_panel addSubview:_lwLabel];
-    UISlider *s1 = [[UISlider alloc] initWithFrame:CGRectMake(12, y + 16, 216, 28)];
+    UISlider *s1 = [[UISlider alloc] initWithFrame:CGRectMake(10, 194, 150, 26)];
     s1.minimumValue = 0.5; s1.maximumValue = 4; s1.value = g_set.lw; s1.tag = 10;
     [s1 addTarget:self action:@selector(slChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:s1];
-    y += 48;
-    _hdLabel = [[UILabel alloc] initWithFrame:CGRectMake(12, y, 216, 16)];
-    _hdLabel.textColor = UIColor.whiteColor; _hdLabel.font = [UIFont systemFontOfSize:11];
+
+    _hdLabel = [[UILabel alloc] initWithFrame:CGRectMake(170, 180, 150, 14)];
+    _hdLabel.textColor = UIColor.whiteColor; _hdLabel.font = [UIFont systemFontOfSize:10];
     [_panel addSubview:_hdLabel];
-    UISlider *s2 = [[UISlider alloc] initWithFrame:CGRectMake(12, y + 16, 216, 28)];
+    UISlider *s2 = [[UISlider alloc] initWithFrame:CGRectMake(170, 194, 150, 26)];
     s2.minimumValue = 1.4; s2.maximumValue = 2.2; s2.value = g_set.head; s2.tag = 11;
     [s2 addTarget:self action:@selector(slChanged:) forControlEvents:UIControlEventValueChanged];
     [_panel addSubview:s2];
-    y += 50;
-    _status = [[UILabel alloc] initWithFrame:CGRectMake(12, y, 216, 44)];
+
+    _status = [[UILabel alloc] initWithFrame:CGRectMake(10, 224, 310, 38)];
     _status.textColor = [UIColor colorWithWhite:0.8 alpha:1];
     _status.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
     _status.numberOfLines = 3;
@@ -548,9 +585,23 @@ static void reconcileChams(const std::vector<void *> &want) {
     [self refreshLabels];
 }
 
+- (void)panMoved:(UIPanGestureRecognizer *)g {
+    UIView *sv = _panel.superview;
+    if (!sv) return;
+    CGPoint t = [g translationInView:sv];
+    CGPoint c = CGPointMake(_panel.center.x + t.x, _panel.center.y + t.y);
+    CGSize hs = CGSizeMake(_panel.bounds.size.width / 2, _panel.bounds.size.height / 2);
+    if (c.x < hs.width * 0.3) c.x = hs.width * 0.3;
+    if (c.y < hs.height * 0.3) c.y = hs.height * 0.3;
+    if (c.x > sv.bounds.size.width - hs.width * 0.3) c.x = sv.bounds.size.width - hs.width * 0.3;
+    if (c.y > sv.bounds.size.height - hs.height * 0.3) c.y = sv.bounds.size.height - hs.height * 0.3;
+    _panel.center = c;
+    [g setTranslation:CGPointMake(0, 0) inView:sv];
+}
+
 - (void)refreshLabels {
     _lwLabel.text = [NSString stringWithFormat:@"Line width: %.1f", g_set.lw];
-    _hdLabel.text = [NSString stringWithFormat:@"Box height (m): %.2f  (use if boxes are off)", g_set.head];
+    _hdLabel.text = [NSString stringWithFormat:@"Box height m: %.2f", g_set.head];
 }
 
 - (void)swChanged:(UISwitch *)s {
@@ -561,6 +612,7 @@ static void reconcileChams(const std::vector<void *> &want) {
         case 3: g_set.chams = s.on; break;
         case 4: g_set.fill = s.on; break;
         case 5: g_set.team = s.on; break;
+        case 6: g_set.lowcpu = s.on; break;
     }
     g_dirty = true; saveSettings();
 }
@@ -571,7 +623,14 @@ static void reconcileChams(const std::vector<void *> &want) {
 }
 - (void)plateTapped { _panel.hidden = !_panel.hidden; }
 
-- (void)tick:(CADisplayLink *)link {
+// Called from a run-loop observer that fires AFTER Unity's frame callback, so bone and camera
+// transforms are the ones of the frame that was just rendered (no one-frame lag).
+- (void)tick {
+    double now = CACurrentMediaTime();
+    double minDt = g_set.lowcpu ? 0.030 : 0.0145;
+    if (now - _lastTick < minDt) return;
+    _lastTick = now;
+
     UIWindow *win = [self keyWindow];
     if (!win) return;
     if (!_btn) {
@@ -595,7 +654,7 @@ static void reconcileChams(const std::vector<void *> &want) {
         if (!g_apiOk) g_apiOk = loadApi();
         if (!g_apiOk) { _status.text = @"il2cpp API missing"; return; }
         if (!resolveAll()) { _status.text = @"waiting for game classes..."; return; }
-        g_ready = true; _tick = 0;
+        g_ready = true; _lastScan = 0;
     }
     if (!_overlay) {
         _overlay = [[UIView alloc] initWithFrame:win.bounds];
@@ -616,7 +675,7 @@ static void reconcileChams(const std::vector<void *> &want) {
     bool scanNow = false;
 
     if (g_set.on) {
-        if (_tick++ % kRefreshTicks == 0) { rescan(g_set.skel || g_set.chams || g_set.box); scanNow = true; }
+        if (now - _lastScan > 1.0) { rescan(g_set.skel || g_set.chams || g_set.box); scanNow = true; _lastScan = now; }
         @try {
             void *cam = d_cam_main(mi_cam_main);
             int sw = d_sw(mi_sw), sh = d_sh(mi_sh);
@@ -657,7 +716,6 @@ static void reconcileChams(const std::vector<void *> &want) {
                     PlayerInfo &pi = *p.pi;
                     for (uint32_t h : pi.smr) { void *r = il2_gc_get(h); if (r) wantChams.push_back(r); }
 
-                    // bones -> screen
                     size_t nb = pi.bone.size();
                     sp.assign(nb, CGPointMake(0, 0)); okp.assign(nb, 0);
                     float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
@@ -670,8 +728,10 @@ static void reconcileChams(const std::vector<void *> &want) {
                         if (s.z <= 0) continue;
                         CGFloat x = s.x / sw * vs.width, y = (1.0 - s.y / sh) * vs.height;
                         sp[b] = CGPointMake(x, y); okp[b] = 1; good++;
-                        if (x < minX) minX = x; if (x > maxX) maxX = x;
-                        if (y < minY) minY = y; if (y > maxY) maxY = y;
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
                     }
                     bool haveBones = good >= 6;
 
@@ -713,6 +773,7 @@ static void reconcileChams(const std::vector<void *> &want) {
         } @catch (...) {}
         g_dirty = false;
     }
+    @try { pumpChamZTest(); } @catch (...) {}
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -727,23 +788,39 @@ static void reconcileChams(const std::vector<void *> &want) {
     if (!_panel.hidden) {
         NSMutableString *cs = [NSMutableString string];
         for (int i = 0; i < kN; i++) [cs appendFormat:@"%s%zu", i ? "/" : "", g_counts[i]];
-        _status.text = [NSString stringWithFormat:@"found %@ | team f%d me%d | draw %d | cam %@\nchams: %@ (%zu on)",
-                        cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-",
-                        g_chamShaderUsed ? [NSString stringWithUTF8String:g_chamShaderUsed] : (g_chamFailed ? @"no shader" : @"-"),
-                        g_chams.size()];
+        NSString *sh = g_chamShaderUsed ? [NSString stringWithUTF8String:g_chamShaderUsed] : (g_chamFailed ? @"no shader" : @"-");
+        _status.text = [NSString stringWithFormat:@"found %@ | team f%d me%d | draw %d | cam %@\nchams: %@ | %s | %zu on",
+                        cs, g_teamField, myTeam, drawn, camOk ? @"ok" : @"-", sh,
+                        g_chamMode == 2 ? "NO x-ray" : "x-ray", g_chams.size()];
     }
 }
 @end
 
 static SCESPDriver *g_driver;
 
+typedef void *(*cf_obs_create)(void *alloc, unsigned long activities, bool repeats, long order, void (^block)(void *obs, unsigned long act));
+typedef void *(*cf_main_loop)(void);
+typedef void (*cf_add_obs)(void *rl, void *obs, void *mode);
+
 __attribute__((constructor)) static void scesp_init(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         loadSettings();
         g_driver = [SCESPDriver new];
-        CADisplayLink *dl = [CADisplayLink displayLinkWithTarget:g_driver selector:@selector(tick:)];
-        dl.preferredFramesPerSecond = 30;
-        [dl addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-        NSLog(@"[SCESP] loaded");
+        // CoreFoundation is resolved at runtime so the dylib needs no extra link flags.
+        cf_obs_create create = (cf_obs_create)dlsym(RTLD_DEFAULT, "CFRunLoopObserverCreateWithHandler");
+        cf_main_loop mainLoop = (cf_main_loop)dlsym(RTLD_DEFAULT, "CFRunLoopGetMain");
+        cf_add_obs addObs = (cf_add_obs)dlsym(RTLD_DEFAULT, "CFRunLoopAddObserver");
+        void **commonModes = (void **)dlsym(RTLD_DEFAULT, "kCFRunLoopCommonModes");
+        if (create && mainLoop && addObs && commonModes) {
+            // kCFRunLoopBeforeWaiting = 1 << 5
+            void *obs = create(nullptr, (1UL << 5), true, 0, ^(void *o, unsigned long act) { [g_driver tick]; });
+            addObs(mainLoop(), obs, *commonModes);
+            NSLog(@"[SCESP] loaded (runloop observer)");
+        } else {
+            CADisplayLink *dl = [CADisplayLink displayLinkWithTarget:g_driver selector:@selector(tick)];
+            dl.preferredFramesPerSecond = 60;
+            [dl addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+            NSLog(@"[SCESP] loaded (display link fallback)");
+        }
     });
 }
