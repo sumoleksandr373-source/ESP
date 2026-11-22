@@ -1,4 +1,4 @@
-// SCESP.mm v5.3 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.4 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -146,6 +146,13 @@ static fn_string_chars il2_str_chars;
 static fn_string_length il2_str_len;
 static fn_class_from_type il2_class_from_type;
 static fn_class_is_vt il2_class_is_vt;
+// engine icalls: exist in the native engine even when the managed wrapper is stripped from the build
+typedef void *(*fn_resolve_icall)(const char *);
+typedef void (*ic_set_bool)(void *, bool);
+typedef bool (*ic_get_bool)(void *);
+static fn_resolve_icall il2_resolve_icall;
+static ic_set_bool ic_cam_set_occ;
+static ic_get_bool ic_cam_get_occ, ic_rend_vis;
 
 struct V3 { float x, y, z; };
 struct Col { float r, g, b, a; };
@@ -192,6 +199,7 @@ static bool loadApi() {
     il2_str_len         = (fn_string_length)sym("il2cpp_string_length");   // optional
     il2_class_from_type = (fn_class_from_type)sym("il2cpp_class_from_type");   // optional (aim learning)
     il2_class_is_vt     = (fn_class_is_vt)sym("il2cpp_class_is_valuetype");    // optional
+    il2_resolve_icall   = (fn_resolve_icall)sym("il2cpp_resolve_icall");          // optional
     return il2_domain_get && il2_get_assemblies && il2_asm_image && il2_image_name &&
            il2_class_from_name && il2_get_method && il2_invoke && il2_class_type &&
            il2_type_object && il2_gc_new && il2_gc_get && il2_gc_free && il2_class_fields &&
@@ -337,6 +345,12 @@ static bool resolveAll() {
 
     for (int i = 0; i < kN; i++) k_targets[i] = il2_class_from_name(game, kTargets[i].ns, kTargets[i].name);
     k_aim = il2_class_from_name(game, "Chillow.StandChillow.Player.Aim", "AimController");
+    if (il2_resolve_icall) {
+        ic_cam_set_occ = (ic_set_bool)il2_resolve_icall("UnityEngine.Camera::set_useOcclusionCulling(System.Boolean)");
+        ic_cam_get_occ = (ic_get_bool)il2_resolve_icall("UnityEngine.Camera::get_useOcclusionCulling()");
+        ic_rend_vis    = (ic_get_bool)il2_resolve_icall("UnityEngine.Renderer::get_isVisible()");
+        NSLog(@"[SCESP] icalls: setOcc=%p getOcc=%p isVisible=%p", ic_cam_set_occ, ic_cam_get_occ, ic_rend_vis);
+    }
     NSLog(@"[SCESP] resolve: find=%p cam=%p w2s=%p tr=%p pos=%p parent=%p bones=%p",
           mi_find, d_cam_main, d_world2screen, d_tr, d_pos, d_parent, mi_get_bones);
     bool any = false; for (int i = 0; i < kN; i++) if (k_targets[i]) any = true;
@@ -644,7 +658,7 @@ static void setOcclusion(bool disabled) {
         if (alive(x)) { void *a[1] = { &en }; inv(mi_beh_enabled, x, a); }
     }
     void *cam = d_cam_main(mi_cam_main);
-    if (cam && alive(cam)) { bool u = !disabled; void *a[1] = { &u }; inv(mi_cam_occ, cam, a); }
+    if (cam && alive(cam)) { bool u = !disabled; void *a[1] = { &u }; inv(mi_cam_occ, cam, a); if (ic_cam_set_occ) ic_cam_set_occ(cam, u); }
     g_occOff = disabled;
 }
 
@@ -653,6 +667,7 @@ static void forceVisible(bool full) {
     // never the first-person arms meshes (they float in the air if switched on).
     void *cam = d_cam_main(mi_cam_main);
     bool haveCam = false; V3 cp = { 0, 0, 0 };
+    if (ic_cam_set_occ && cam && alive(cam)) ic_cam_set_occ(cam, false);   // keep Unity's baked occlusion culling off
     if (cam && alive(cam)) { void *ct = d_tr(cam, mi_tr); if (ct) { cp = d_pos(ct, mi_pos); haveCam = true; } }
     for (auto &p : g_pl) {
         void *po = il2_gc_get(p.obj);
@@ -869,13 +884,13 @@ static int unboxInt(void *b) { return b ? *(int *)((char *)b + 16) : -1; }
 static NSString *diagRenderer(void *r) {
     if (!r || !alive(r)) return @"diag: -";
     int en = mi_rend_get_enabled ? unboxBool(inv(mi_rend_get_enabled, r, nullptr)) : -1;
-    int vis = mi_rend_isvis ? unboxBool(inv(mi_rend_isvis, r, nullptr)) : -1;
+    int vis = ic_rend_vis ? (int)ic_rend_vis(r) : (mi_rend_isvis ? unboxBool(inv(mi_rend_isvis, r, nullptr)) : -1);
     int fo = mi_rend_get_froff ? unboxBool(inv(mi_rend_get_froff, r, nullptr)) : -1;
     int act = -1, layer = -1;
     void *go = mi_get_go ? inv(mi_get_go, r, nullptr) : nullptr;
     if (go) { act = mi_go_active ? unboxBool(inv(mi_go_active, go, nullptr)) : -1; layer = mi_go_layer ? unboxInt(inv(mi_go_layer, go, nullptr)) : -1; }
     void *cam = d_cam_main(mi_cam_main);
-    int co = (cam && mi_cam_get_occ) ? unboxBool(inv(mi_cam_get_occ, cam, nullptr)) : -1;
+    int co = (cam && ic_cam_get_occ) ? (int)ic_cam_get_occ(cam) : ((cam && mi_cam_get_occ) ? unboxBool(inv(mi_cam_get_occ, cam, nullptr)) : -1);
     return [NSString stringWithFormat:@"diag e%d v%d f%d act%d L%d camOcc%d", en, vis, fo, act, layer, co];
 }
 
