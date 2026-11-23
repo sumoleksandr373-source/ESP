@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -17,7 +17,7 @@ jobs:
             -miphoneos-version-min=15.0 \
             -dynamiclib -fobjc-arc -O2 \
             -install_name @rpath/libSCESP.dylib \
-            -framework UIKit -framework QuartzCore -framework Foundation \
+            -framework Foundation -framework UIKit -framework QuartzCore -framework SceneKit \
             -o libSCESP.dylib SCESP.mm
           file libSCESP.dylib
           ls -la libSCESP.dylib
