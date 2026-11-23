@@ -55,6 +55,7 @@ struct Settings {
     float fov = 45.0f;      // aim capture cone, degrees
     float aimSpeed = 14.0f; // aim smoothing: higher = snappier (1/s)
     bool drawFov = true;    // draw the aim capture outline on screen
+    bool dmg = true;        // floating damage numbers
 };
 static Settings g_set;
 static bool g_dirty = true;
@@ -84,6 +85,7 @@ static void saveSettings() {
     [d setFloat:g_set.fov forKey:@"scesp_fov"];
     [d setFloat:g_set.aimSpeed forKey:@"scesp_aspd"];
     [d setBool:g_set.drawFov forKey:@"scesp_dfov"];
+    [d setBool:g_set.dmg forKey:@"scesp_dmgnum"];
 }
 static void loadSettings() {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -102,6 +104,7 @@ static void loadSettings() {
     g_set.fov = [d floatForKey:@"scesp_fov"]; if (g_set.fov < 5.0f) g_set.fov = 45.0f;
     g_set.aimSpeed = [d floatForKey:@"scesp_aspd"]; if (g_set.aimSpeed < 2.0f) g_set.aimSpeed = 14.0f;
     g_set.drawFov = [d objectForKey:@"scesp_dfov"] ? [d boolForKey:@"scesp_dfov"] : true;
+    g_set.dmg = [d objectForKey:@"scesp_dmgnum"] ? [d boolForKey:@"scesp_dmgnum"] : true;
 }
 
 // ---- il2cpp API ------------------------------------------------------------------------
@@ -909,6 +912,16 @@ static void *localAim(void *me) {                       // exact local AimContro
     return (a && *(void **)((char *)a + 0xC8) == me) ? a : nullptr;
 }
 static std::unordered_map<void *, float> g_hpMax;
+// ---- floating damage numbers ----
+struct DmgPop { void *id; V3 pos; float amount; double t0; };
+struct DmgDraw { CGPoint p; float a, amt, k; };
+static std::vector<DmgPop> g_pops;
+static std::unordered_map<void *, float> g_hpPrev;      // last HP seen per character; a drop = damage taken
+static void dmgSpawn(void *id, V3 pos, float amt, double now) {
+    for (auto &d : g_pops) if (d.id == id && now - d.t0 < 0.25) { d.amount += amt; d.t0 = now; d.pos = pos; return; }   // burst fire -> one growing number
+    if (g_pops.size() >= 10) g_pops.erase(g_pops.begin());
+    g_pops.push_back({ id, pos, amt, now });
+}
 // HP straight from the game's own getter (works for every character at any time), learned field only as a fallback
 static bool readHp(void *obj, PlayerInfo *pi, float &out) {
     if (mi_hp && obj) {
@@ -1453,7 +1466,7 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
     UILabel *_status;
     UILabel *_lwLabel, *_hdLabel, *_fovLabel, *_spdLabel, *_aimInfo, *_tabTitle;
     CAShapeLayer *_fovRing;
-    NSMutableArray *_pages, *_tabs, *_swatches;
+    NSMutableArray *_pages, *_tabs, *_swatches, *_dmgLabels;
     int _frame, _vfy;
     void *_diagR;
     double _lastTick, _lastScan;
@@ -1572,6 +1585,7 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
         nlToggle(a, @"Chams", 3, g_set.chams, self, @selector(swChanged:));
         nlToggle(a, @"Head dot", 12, g_set.hdot, self, @selector(swChanged:));
         nlToggle(a, @"Health bar", 9, g_set.hp, self, @selector(swChanged:));
+        nlToggle(a, @"Damage numbers", 16, g_set.dmg, self, @selector(swChanged:));
         nlToggle(a, @"Teammates", 5, g_set.team, self, @selector(swChanged:));
         nlEnd(a);
         NLCard b = nlCard(pg, @"Style", CW + 8, 0, CW);
@@ -1655,6 +1669,7 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
         case 9: g_set.hp = s.on; break;
         case 12: g_set.hdot = s.on; break;
         case 15: g_set.drawFov = s.on; break;
+        case 16: g_set.dmg = s.on; if (!s.on) g_pops.clear(); break;
     }
     g_dirty = true; saveSettings();
 }
@@ -1750,6 +1765,7 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
     bool wantHp = g_set.hp && (mi_hp || g_haveHp);
     UIBezierPath *dotPath = [UIBezierPath bezierPath];
     UIBezierPath *fovPath = [UIBezierPath bezierPath];
+    std::vector<DmgDraw> dd;
     int drawn = 0, myTeam = -1;
     bool camOk = false;
     std::vector<void *> wantChams;
@@ -1823,7 +1839,18 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                         if (y < minY) minY = y;
                         if (y > maxY) maxY = y;
                     }
-                    float hpv = 0; bool hpOk = wantHp && readHp(p.obj, &pi, hpv);
+                    float hpv = 0;
+                    bool needHp = wantHp || ((mi_hp || g_haveHp) && (g_set.dmg || g_set.aim));
+                    bool hpOk = needHp && readHp(p.obj, &pi, hpv);
+                    if (g_set.dmg && hpOk) {
+                        if (g_hpPrev.size() > 128) g_hpPrev.clear();
+                        auto it = g_hpPrev.find(p.obj);
+                        if (it != g_hpPrev.end() && hpv < it->second - 0.5f && it->second < 1000.f) {
+                            V3 hp3 = hy > -1e8f ? hw : V3{ p.pos.x, p.pos.y + 1.6f, p.pos.z };
+                            dmgSpawn(p.obj, { hp3.x, hp3.y + 0.15f, hp3.z }, it->second - hpv, now);
+                        }
+                        g_hpPrev[p.obj] = hpv;
+                    }
                     bool botObj = isBotObj(p.obj);
                     if (botObj) nBots++;
                     {
@@ -1871,7 +1898,7 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                         }
                         if (g_set.box || g_set.fill) [boxPath appendPath:[UIBezierPath bezierPathWithRect:r]];
                         float hv = hpv;
-                        if (hpOk && hv > 0.f && hv < 1e6f) {
+                        if (wantHp && hpOk && hv > 0.f && hv < 1e6f) {
                             if (g_hpMax.size() > 128) g_hpMax.clear();
                             float &mx = g_hpMax[p.obj];
                             if (mx < (mi_hp ? 100.f : g_hpRef)) mx = mi_hp ? 100.f : g_hpRef;
@@ -1888,6 +1915,23 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                 }
                 // ---- aim FOV outline: a real cone around the view direction (same test the target selection uses) ----
                 g_nBots = nBots;
+                for (size_t i = 0; i < g_pops.size();) {
+                    DmgPop &d = g_pops[i];
+                    float age = (float)(now - d.t0), life = 1.15f;
+                    if (!g_set.dmg || age > life) { g_pops.erase(g_pops.begin() + i); continue; }
+                    V3 s3 = d_world2screen(cam, d.pos, mi_w2s);
+                    if (s3.z > 0) {
+                        float p = age / life, e = 1.f - (1.f - p) * (1.f - p);          // ease-out
+                        CGPoint base = CGPointMake(s3.x / sw * vs.width, (1.0 - s3.y / sh) * vs.height);
+                        DmgDraw dr;
+                        dr.p = CGPointMake(base.x - 8 - 56 * e, base.y - 6 - 64 * e);   // slides up and to the left of the bot
+                        dr.a = p < 0.6f ? 1.f : 1.f - (p - 0.6f) / 0.4f;
+                        dr.amt = d.amount;
+                        dr.k = age < 0.12f ? 1.35f - 0.35f * (age / 0.12f) : 1.f;       // little pop-in
+                        dd.push_back(dr);
+                    }
+                    i++;
+                }
                 if (g_set.drawFov && mi_fwd && d_fwd) {
                     V3 f0 = d_fwd(ctr, mi_fwd);
                     float fl = sqrtf(f0.x * f0.x + f0.y * f0.y + f0.z * f0.z);
@@ -1982,6 +2026,24 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
     _fovRing.strokeColor = ((g_set.aim && g_lockId) ? nlRGB(70, 255, 120, 0.95) : nlRGB(61, 166, 255, 0.75)).CGColor;
     _hdot.frame = _overlay.bounds; _hdot.path = dotPath.CGPath; _hdot.fillColor = colorFor(g_set.color, 1).CGColor;
     _hpBack.path = hpBack.CGPath; _hpG.path = hpG.CGPath; _hpY.path = hpY.CGPath; _hpR.path = hpR.CGPath;
+    if (!_dmgLabels) _dmgLabels = [NSMutableArray array];
+    while (_dmgLabels.count < 10) {
+        UILabel *dl = [[UILabel alloc] init];
+        dl.hidden = YES; dl.userInteractionEnabled = NO; dl.textAlignment = NSTextAlignmentCenter;
+        dl.shadowColor = [UIColor colorWithWhite:0 alpha:0.9]; dl.shadowOffset = CGSizeMake(1, 1);
+        [_overlay addSubview:dl]; [_dmgLabels addObject:dl];
+    }
+    for (NSUInteger i = 0; i < _dmgLabels.count; i++) {
+        UILabel *dl = _dmgLabels[i];
+        if (i >= dd.size()) { dl.hidden = YES; continue; }
+        const DmgDraw &dr = dd[i];
+        int amt = (int)lroundf(dr.amt);
+        dl.text = [NSString stringWithFormat:@"-%d", amt];
+        dl.font = [UIFont systemFontOfSize:(13.f + fminf(dr.amt, 100.f) * 0.09f) * dr.k weight:UIFontWeightHeavy];
+        dl.textColor = dr.amt >= 60 ? nlRGB(255, 70, 70) : (dr.amt >= 30 ? nlRGB(255, 205, 70) : UIColor.whiteColor);
+        [dl sizeToFit];
+        dl.center = dr.p; dl.alpha = dr.a; dl.hidden = NO;
+    }
     [CATransaction commit];
 
     if (!_panel.hidden) {
