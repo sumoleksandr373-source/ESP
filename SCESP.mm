@@ -1843,7 +1843,7 @@ static SCNNode *buildAgentModel() {
 - (void)agentPanned:(UIPanGestureRecognizer *)g {
     CGPoint t = [g translationInView:_agentView];
     SCNVector3 e = _agentRoot.eulerAngles; e.y += t.x * 0.014f; _agentRoot.eulerAngles = e;
-    [g setTranslation:CGPointZero inView:_agentView];
+    [g setTranslation:CGPointMake(0, 0) inView:_agentView];
 }
 - (void)agentRotateTapped:(UIButton *)b {
     [SCNTransaction begin]; [SCNTransaction setAnimationDuration:0.25];
