@@ -1,4 +1,4 @@
-// SCESP.mm v5.6 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.5 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill / health bar, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -274,6 +274,11 @@ static const int kHpRoots = 6;
 static void *k_hpRoot[kHpRoots];
 static bool g_hpRoots = false;          // rescan() also collects the root components per player
 static void *k_targets[8];
+// offsets from the static dump (StandChillow 2.07): PlayerController fields + HP getter
+static const int kOffBot = 0xC8;      // PlayerController.<cfip> : BotPlayerController  (non-null = bot)
+static const int kOffAim = 0xD0;      // PlayerController.<cfiq> : AimController         (back-reference at AimController +0xC8)
+static void *mi_hp;                   // PlayerController.ode() -> int  current HP
+static int g_nBots = 0;
 static size_t g_counts[8];
 static int g_active = -1;
 static std::vector<int> g_teamOffsets;
@@ -290,7 +295,6 @@ static void *mi_get_go, *mi_go_active, *mi_go_layer, *mi_rend_allow;
 static d_get_main d_cam_main;  static void *mi_cam_main;
 static d_obj_get d_tr;         static void *mi_tr;
 static d_obj_get d_parent;     static void *mi_parent;
-static d_obj_get d_root;       static void *mi_root;
 static d_get_position d_pos;   static void *mi_pos;
 static d_w2s d_world2screen;   static void *mi_w2s;
 static d_screen d_sw, d_sh;    static void *mi_sw, *mi_sh;
@@ -326,7 +330,6 @@ static bool resolveAll() {
     mi_tr       = il2_get_method(cComp, "get_transform", 0);
     mi_pos      = il2_get_method(cTrans, "get_position", 0);
     mi_parent   = il2_get_method(cTrans, "get_parent", 0);
-    mi_root     = il2_get_method(cTrans, "get_root", 0);   // optional: tie AimController to the local character
     mi_fwd      = il2_get_method(cTrans, "get_forward", 0);
     mi_sw       = il2_get_method(cScreen, "get_width", 0);
     mi_sh       = il2_get_method(cScreen, "get_height", 0);
@@ -334,7 +337,6 @@ static bool resolveAll() {
     d_world2screen = (d_w2s)direct(mi_w2s);
     d_tr  = (d_obj_get)direct(mi_tr);
     d_parent = (d_obj_get)direct(mi_parent);
-    d_root = (d_obj_get)direct(mi_root);
     d_fwd = (d_get_position)direct(mi_fwd);
     d_pos = (d_get_position)direct(mi_pos);
     d_sw  = (d_screen)direct(mi_sw);
@@ -383,6 +385,9 @@ static bool resolveAll() {
     }
 
     for (int i = 0; i < kN; i++) k_targets[i] = il2_class_from_name(game, kTargets[i].ns, kTargets[i].name);
+    { void *kpc = il2_class_from_name(game, "Chillow.StandChillow.Player", "PlayerController");
+      if (kpc) mi_hp = il2_get_method(kpc, "ode", 0);
+      NSLog(@"[SCESP] PlayerController.ode() = %p", mi_hp); }
     k_aim = il2_class_from_name(game, "Chillow.StandChillow.Player.Aim", "AimController");
     for (int r = 1; r < kHpRoots; r++) k_hpRoot[r] = il2_class_from_name(game, kHpRootDefs[r].ns, kHpRootDefs[r].name);
     if (il2_resolve_icall) {
@@ -413,20 +418,9 @@ static void findTeamFields(void *klass) {
 }
 
 static inline bool alive(void *obj) { return obj && *(void **)((char *)obj + 16) != nullptr; }
-static bool transformIsAncestor(void *child, void *ancestor) {
-    if (!child || !ancestor || !d_parent) return false;
-    for (int depth = 0; depth < 32 && child; depth++) {
-        if (child == ancestor) return true;
-        child = d_parent(child, mi_parent);
-    }
-    return false;
-}
 static inline int readTeam(void *obj, int field) {
     if (field < 0 || field >= (int)g_teamOffsets.size()) return 0;
-    // Core.Team is an enum backed by System.Byte (metadata TypeDef #6509).
-    // Reading four bytes here also consumes neighbouring padding/fields and
-    // can make valid team IDs appear as unrelated large integers.
-    return (int)*(uint8_t *)((char *)obj + g_teamOffsets[field]);
+    return *(int *)((char *)obj + g_teamOffsets[field]);
 }
 
 // ---- aim lock (offline) ----------------------------------------------------------------
@@ -484,30 +478,18 @@ static float *candAddr(const Cand &c, void *me, void *aim) {
     if (c.deref) { char *p = *(char **)(o + c.off); return p ? (float *)(p + c.off2) : nullptr; }
     return (float *)(o + c.off);
 }
-static void *nearestAim(V3 cp, void *meObj) {
-    // Prefer an AimController on the same Transform root as the local player.
-    // The camera can be offset behind the player, so camera-distance alone can
-    // accidentally select a nearby bot's AimController.
-    void *meTr = (meObj && d_tr) ? d_tr(meObj, mi_tr) : nullptr;
-    V3 ref = meTr ? d_pos(meTr, mi_pos) : cp;
-    void *meRoot = (meTr && d_root) ? d_root(meTr, mi_root) : nullptr;
-    void *bestRoot = nullptr, *best = nullptr;
-    float rootDist = 1e9f, bd = 1e9f;
+static void *nearestAim(V3 cp) {
+    void *best = nullptr; float bd = 1e9f;
     for (uint32_t h : g_aimH) {
         void *o = il2_gc_get(h);
         if (!alive(o)) continue;
         void *tr = d_tr(o, mi_tr);
         if (!tr) continue;
         V3 q = d_pos(tr, mi_pos);
-        float dx = q.x - ref.x, dy = q.y - ref.y, dz = q.z - ref.z;
-        float d = dx * dx + dy * dy + dz * dz;
-        if (meRoot && d_root && d_root(tr, mi_root) == meRoot) {
-            if (d < rootDist) { rootDist = d; bestRoot = o; }
-        } else if (d < bd) {
-            bd = d; best = o;
-        }
+        float dx = q.x - cp.x, dy = q.y - cp.y, dz = q.z - cp.z, d = dx * dx + dy * dy + dz * dz;
+        if (d < bd) { bd = d; best = o; }
     }
-    return bestRoot ? bestRoot : best;
+    return best;
 }
 static void saveAim() {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -682,6 +664,13 @@ struct AimTg { V3 pos; void *id; };
 static void *g_lockId = nullptr;         // target we are currently locked on (sticky, so we do not flick between bots)
 // Runs on EVERY tick with the real elapsed time: first-order approach to the target, so the motion does not depend
 // on the tick rate (the run loop can wake several times per frame). Small cap on the angular speed = no snapping.
+// AimController -> AimingData (+0x80): curEulerAngles.y (+0x28) is the yaw, curAimAngle.x (+0x18) the pitch, in degrees
+static void useDumpFields() {
+    g_yawC.src = 1; g_yawC.deref = 1; g_yawC.off = 0x80; g_yawC.off2 = 0x28; g_yawK = 1.f; g_haveYaw = true;
+    g_pitC.src = 1; g_pitC.deref = 1; g_pitC.off = 0x80; g_pitC.off2 = 0x18; g_pitK = 1.f; g_havePit = true;
+    saveAim();
+    g_learnMsg = @"aim: AimingData fields from the dump"; g_msgUntil = CACurrentMediaTime() + 8;
+}
 static void aimStep(void *me, void *aim, float dyaw, float dpit, float dt) {
     float *py = candAddr(g_yawC, me, aim), *pp = candAddr(g_pitC, me, aim);
     float s = 1.f - expf(-dt * g_set.aimSpeed);
@@ -757,29 +746,13 @@ static void rescan(bool wantBones) {
     for (uint32_t h : g_aimH) il2_gc_free(h);
     g_aimH.clear();
     if (k_aim) { std::vector<void *> ao; findObjs(k_aim, ao, 32); for (void *x : ao) g_aimH.push_back(il2_gc_new(x, 0)); }
-    // Gather every known player-controller type. The previous code stopped at
-    // the first non-empty class, which could return only the local PlayerController
-    // and omit bots exposed through BotPlayerController / CharacterPlayer.
-    std::unordered_map<void *, bool> seen;
-    int firstActive = -1;
-    for (int t = 0; t < kN; t++) {
-        if (!k_targets[t]) continue;
-        std::vector<void *> typed;
-        g_counts[t] = findObjs(k_targets[t], typed, 64);
-        if (g_counts[t] > 0 && firstActive < 0) firstActive = t;
-        for (void *x : typed) {
-            if (!x) continue;
-            // The same character may expose more than one controller component.
-            // Deduplicate components on the same GameObject when that API exists.
-            void *key = mi_get_go ? inv(mi_get_go, x, nullptr) : nullptr;
-            if (!key) key = x;
-            if (seen.emplace(key, true).second) objs.push_back(x);
+    if (g_active >= 0 && k_targets[g_active]) g_counts[g_active] = findObjs(k_targets[g_active], objs, 64);
+    if (objs.empty()) {
+        for (int t = 0; t < kN; t++) {
+            if (!k_targets[t]) continue;
+            g_counts[t] = findObjs(k_targets[t], objs, 64);
+            if (g_counts[t] > 0) { if (g_active != t) { g_active = t; findTeamFields(k_targets[t]); } break; }
         }
-    }
-    if (firstActive != g_active) {
-        g_active = firstActive;
-        if (g_active >= 0) findTeamFields(k_targets[g_active]);
-        else { g_teamOffsets.clear(); g_teamField = -1; }
     }
 
     std::vector<PlayerInfo> fresh(objs.size());
@@ -928,6 +901,22 @@ static bool readCand(const HCand &c, void *playerObj, PlayerInfo *pi, float &out
         default: return false;
     }
     return out == out;
+}
+static bool isBotObj(void *o) { return o && *(void **)((char *)o + kOffBot) != nullptr; }
+static void *localAim(void *me) {                       // exact local AimController, validated by its back-reference
+    if (!me) return nullptr;
+    void *a = *(void **)((char *)me + kOffAim);
+    return (a && *(void **)((char *)a + 0xC8) == me) ? a : nullptr;
+}
+static std::unordered_map<void *, float> g_hpMax;
+// HP straight from the game's own getter (works for every character at any time), learned field only as a fallback
+static bool readHp(void *obj, PlayerInfo *pi, float &out) {
+    if (mi_hp && obj) {
+        void *b = inv(mi_hp, obj, nullptr);
+        if (b) { int v = *(int *)((char *)b + 16); if (v >= 0 && v < 100000) { out = (float)v; return true; } }
+    }
+    if (g_haveHp) return readCand(g_hpC, obj, pi, out);
+    return false;
 }
 static NSString *hpName(const HCand &c) {
     static const char *kn[] = { "float", "int", "obsF", "obsI" };
@@ -1567,7 +1556,8 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
         nlEnd(a);
         NLCard b = nlCard(pg, @"Look fields", CW + 8, 0, CW);
         nlButton(b, @"Learn look fields", self, @selector(learnTapped));
-        _aimInfo = nlInfo(b, 72, 9);
+        nlButton(b, @"Use dump fields", self, @selector(dumpFieldsTapped));
+        _aimInfo = nlInfo(b, 44, 9);
         nlEnd(b);
         pg.contentSize = CGSizeMake(PW, fmax(nlMaxY(a.v.frame), nlMaxY(b.v.frame)) + 8);
     }
@@ -1674,6 +1664,7 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
     [self refreshLabels]; saveSettings();
 }
 - (void)plateTapped { _panel.hidden = !_panel.hidden; }
+- (void)dumpFieldsTapped { useDumpFields(); }
 - (void)learnTapped {
     if (!g_ready) return;
     if (g_learn) { learnFinish(); return; }
@@ -1756,7 +1747,7 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
     UIBezierPath *boxPath = [UIBezierPath bezierPath];
     UIBezierPath *skelPath = [UIBezierPath bezierPath];
     UIBezierPath *hpBack = [UIBezierPath bezierPath], *hpG = [UIBezierPath bezierPath], *hpY = [UIBezierPath bezierPath], *hpR = [UIBezierPath bezierPath];
-    bool wantHp = g_set.hp && g_haveHp;
+    bool wantHp = g_set.hp && (mi_hp || g_haveHp);
     UIBezierPath *dotPath = [UIBezierPath bezierPath];
     UIBezierPath *fovPath = [UIBezierPath bezierPath];
     int drawn = 0, myTeam = -1;
@@ -1785,10 +1776,7 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                     if (!tr) continue;
                     V3 pos = d_pos(tr, mi_pos);
                     float dx = pos.x - camPos.x, dz = pos.z - camPos.z;
-                    // The camera may be offset from the body in third-person view.
-                    // Prefer its actual Transform ancestry, then use the old proximity fallback.
-                    bool cameraChild = transformIsAncestor(ctr, tr);
-                    ps.push_back({ &pi, obj, pos, cameraChild || dx * dx + dz * dz < kSelfRadius * kSelfRadius });
+                    ps.push_back({ &pi, obj, pos, dx * dx + dz * dz < kSelfRadius * kSelfRadius });
                 }
                 if (g_teamField < 0 && !g_teamOffsets.empty()) {
                     for (int f = 0; f < (int)g_teamOffsets.size(); f++) {
@@ -1799,16 +1787,14 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                 }
                 for (auto &p : ps) if (p.self && g_teamField >= 0) myTeam = readTeam(p.obj, g_teamField);
 
-                std::vector<AimTg> tg; void *meObj = nullptr;
+                std::vector<AimTg> tg; void *meObj = nullptr; int nBots = 0;
                 for (auto &p : ps) if (p.self) meObj = p.obj;
                 std::vector<CGPoint> sp; std::vector<char> okp;
                 for (auto &p : ps) {
                     if (p.self) continue;
                     if (g_teamField >= 0) {
                         int tv = readTeam(p.obj, g_teamField);
-                        // Offline bots can briefly report Team::None (0). Keep those
-                        // candidates; only discard spectators and known teammates.
-                        if (tv == 3) continue;
+                        if (tv != 1 && tv != 2) continue;
                         if (!g_set.team && (myTeam == 1 || myTeam == 2) && tv == myTeam) continue;
                     }
                     PlayerInfo &pi = *p.pi;
@@ -1837,10 +1823,12 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                         if (y < minY) minY = y;
                         if (y > maxY) maxY = y;
                     }
+                    float hpv = 0; bool hpOk = wantHp && readHp(p.obj, &pi, hpv);
+                    bool botObj = isBotObj(p.obj);
+                    if (botObj) nBots++;
                     {
-                        bool dead = false;
-                        if (wantHp) { float hv0; if (readCand(g_hpC, p.obj, &pi, hv0) && hv0 <= 0.f) dead = true; }   // never lock on corpses
-                        if (!dead) {
+                        bool dead = hpOk && hpv <= 0.f;                       // never lock on corpses
+                        if (!dead && botObj) {                                // aim lock targets bots only
                             if (hy > -1e8f) tg.push_back({ hw, p.obj });
                             else tg.push_back({ { p.pos.x, p.pos.y + 1.6f, p.pos.z }, p.obj });
                         }
@@ -1882,10 +1870,13 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                             r = CGRectMake(cx - bw / 2, hy, bw, bh);
                         }
                         if (g_set.box || g_set.fill) [boxPath appendPath:[UIBezierPath bezierPathWithRect:r]];
-                        float hv;
-                        if (wantHp && readCand(g_hpC, p.obj, &pi, hv) && hv > 0.f && hv < 1e6f) {
-                            if (hv > g_hpRef) g_hpRef = hv;
-                            CGFloat ratio = fminf(1.f, hv / g_hpRef);
+                        float hv = hpv;
+                        if (hpOk && hv > 0.f && hv < 1e6f) {
+                            if (g_hpMax.size() > 128) g_hpMax.clear();
+                            float &mx = g_hpMax[p.obj];
+                            if (mx < (mi_hp ? 100.f : g_hpRef)) mx = mi_hp ? 100.f : g_hpRef;
+                            if (hv > mx) mx = hv;
+                            CGFloat ratio = fminf(1.f, hv / mx);
                             CGFloat bw = fmax(3.0, g_set.lw * 2), bx = r.origin.x - bw - 3;
                             [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
                             CGFloat fh = r.size.height * ratio;
@@ -1895,17 +1886,23 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                     }
                     drawn++;
                 }
-                // ---- aim FOV outline: exactly the set of directions the target selection accepts ----
+                // ---- aim FOV outline: a real cone around the view direction (same test the target selection uses) ----
+                g_nBots = nBots;
                 if (g_set.drawFov && mi_fwd && d_fwd) {
                     V3 f0 = d_fwd(ctr, mi_fwd);
-                    float cy0 = atan2f(f0.x, f0.z) * 57.29578f;
-                    float cp0 = -asinf(fmaxf(-1.f, fminf(1.f, f0.y))) * 57.29578f;
+                    float fl = sqrtf(f0.x * f0.x + f0.y * f0.y + f0.z * f0.z);
+                    if (fl > 1e-4f) { f0.x /= fl; f0.y /= fl; f0.z /= fl; }
+                    V3 r = { f0.z, 0.f, -f0.x };                                   // right = up x forward
+                    float rl = sqrtf(r.x * r.x + r.z * r.z);
+                    if (rl < 1e-3f) r = { 1.f, 0.f, 0.f }; else { r.x /= rl; r.z /= rl; }
+                    V3 u = { f0.y * r.z - f0.z * r.y, f0.z * r.x - f0.x * r.z, f0.x * r.y - f0.y * r.x };   // up = forward x right
+                    float th = fminf(g_set.fov, 85.f) * 0.0174533f, ct = cosf(th), st = sinf(th);
                     const int N = 72;
                     bool brk = true;
                     for (int i = 0; i <= N; i++) {
-                        float ph = (float)i / N * 6.2831853f;
-                        float yaw = (cy0 + g_set.fov * cosf(ph)) * 0.0174533f, pit = (cp0 + g_set.fov * sinf(ph)) * 0.0174533f;
-                        V3 wp = { camPos.x + sinf(yaw) * cosf(pit) * 20.f, camPos.y - sinf(pit) * 20.f, camPos.z + cosf(yaw) * cosf(pit) * 20.f };
+                        float ph = (float)i / N * 6.2831853f, cx = cosf(ph), sy = sinf(ph);
+                        V3 d = { f0.x * ct + (r.x * cx + u.x * sy) * st, f0.y * ct + (r.y * cx + u.y * sy) * st, f0.z * ct + (r.z * cx + u.z * sy) * st };
+                        V3 wp = { camPos.x + d.x * 20.f, camPos.y + d.y * 20.f, camPos.z + d.z * 20.f };
                         V3 s2 = d_world2screen(cam, wp, mi_w2s);
                         if (s2.z <= 0) { brk = true; continue; }
                         CGPoint pt = CGPointMake(s2.x / sw * vs.width, (1.0 - s2.y / sh) * vs.height);
@@ -1917,7 +1914,8 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                     V3 f = d_fwd(ctr, mi_fwd);
                     float curYaw = atan2f(f.x, f.z) * 57.29578f;
                     float curPit = -asinf(fmaxf(-1.f, fminf(1.f, f.y))) * 57.29578f;
-                    void *aimObj = nearestAim(camPos, meObj);
+                    void *aimObj = localAim(meObj);
+                    if (!aimObj) aimObj = nearestAim(camPos);          // fallback only
                     if (g_learn) {
                         learnStep(meObj, aimObj, curYaw, curPit);
                         if (now - g_learnT0 > 6.0) learnFinish();
@@ -1933,7 +1931,7 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                             float len = sqrtf(dx * dx + dy * dy + dz * dz);
                             if (len < 0.5f) continue;
                             float ey = wrap180(atan2f(dx, dz) * 57.29578f - curYaw), ep = -asinf(dy / len) * 57.29578f - curPit;
-                            float e = sqrtf(ey * ey + ep * ep);
+                            float e = acosf(fmaxf(-1.f, fminf(1.f, (f.x * dx + f.y * dy + f.z * dz) / len))) * 57.29578f;   // true angle to the view direction
                             bool cur = t.id && t.id == g_lockId;
                             if (e > g_set.fov * (cur ? 1.3f : 1.0f)) continue;      // hysteresis: a locked target may drift out a bit further
                             float score = cur ? e * 0.55f : e;                      // sticky: only switch when another bot is clearly closer
@@ -1996,9 +1994,9 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
                         g_occOff ? "off" : "on"];
         @try {
             NSString *l3 = (g_learn || now < g_msgUntil) ? g_learnMsg
-                         : (g_set.aim ? ((g_haveYaw && g_havePit) ? @"aim: ON, look fields learned" : @"aim: ON but NOT learned -> Learn look fields")
+                         : (g_set.aim ? ((g_haveYaw && g_havePit) ? [NSString stringWithFormat:@"aim: ON, bots %d%@", g_nBots, g_nBots ? @"" : @" (none: no lock)"] : @"aim: ON but NOT learned -> Learn look fields")
                                       : diagRenderer(diagR));
-            _status.text = [_status.text stringByAppendingFormat:@"\n%@\n%@", l3, g_hpMsg];
+            _status.text = [_status.text stringByAppendingFormat:@"\n%@\n%@", l3, mi_hp ? @"hp: PlayerController.ode()" : g_hpMsg];
             _aimInfo.text = l3;
         } @catch (...) {}
     }
@@ -2015,6 +2013,7 @@ __attribute__((constructor)) static void scesp_init(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         loadSettings();
         loadAim();
+        if (!(g_haveYaw && g_havePit)) useDumpFields();
         loadHp();
         g_driver = [SCESPDriver new];
         // CoreFoundation is resolved at runtime so the dylib needs no extra link flags.
