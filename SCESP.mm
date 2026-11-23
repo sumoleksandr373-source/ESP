@@ -1,4 +1,4 @@
-// SCESP.mm v5.6 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
+// SCESP.mm v5.5 — StandChillow (Unity IL2CPP, iOS arm64), ESP for offline bot matches
 //
 // Box / skeleton / chams / box fill / health bar, enemies only (teammates optional), settings panel.
 // Tap the small "ESP" plate (top-left) to open/close the settings panel.
@@ -44,8 +44,27 @@ static const char *kChamShaders[] = { "Hidden/Internal-Colored", "GUI/Text Shade
 static const char *kBoneSkip[] = { "root", "ik", "target", "pole", "weapon", "gun" };
 // bones further than this from the player pivot are junk (IK helpers, world-origin bones)
 static const float kBelowFeet = 0.3f, kMaxReach = 2.0f;
-static const float kDmgRayTol = 0.5f;   // m: my view ray must pass this close to a bone of the bot for a drop to count as MY damage
 static const float kAimFov = 18.0f;   // degrees: aim lock only grabs targets this close to the crosshair
+
+// ---- aim body-part selection ------------------------------------------------------------
+enum AimPart : int {
+    kAimHead = 0, kAimNeck, kAimChest, kAimStomach,
+    kAimPelvis, kAimArm, kAimLeg, kAimFoot, kAimPartCount
+};
+static int g_selectedAimPart = kAimHead;
+static NSString *aimPartTitle(int part) {
+    switch (part) {
+        case kAimHead: return @"Head";
+        case kAimNeck: return @"Neck";
+        case kAimChest: return @"Chest";
+        case kAimStomach: return @"Stomach";
+        case kAimPelvis: return @"Pelvis";
+        case kAimArm: return @"Arms";
+        case kAimLeg: return @"Legs";
+        case kAimFoot: return @"Feet";
+        default: return @"Head";
+    }
+}
 
 // ---- settings --------------------------------------------------------------------------
 struct Settings {
@@ -57,8 +76,6 @@ struct Settings {
     float aimSpeed = 14.0f; // aim smoothing: higher = snappier (1/s)
     bool drawFov = true;    // draw the aim capture outline on screen
     bool dmg = true;        // floating damage numbers
-    bool dmgMine = true;    // damage numbers only for hits that go through MY crosshair (not bot-vs-bot)
-    int  aimBone = 0;       // aim point: 0 head, 1 neck, 2 chest, 3 body, 4 nearest bone to crosshair
 };
 static Settings g_set;
 static bool g_dirty = true;
@@ -89,8 +106,7 @@ static void saveSettings() {
     [d setFloat:g_set.aimSpeed forKey:@"scesp_aspd"];
     [d setBool:g_set.drawFov forKey:@"scesp_dfov"];
     [d setBool:g_set.dmg forKey:@"scesp_dmgnum"];
-    [d setBool:g_set.dmgMine forKey:@"scesp_dmine"];
-    [d setInteger:g_set.aimBone forKey:@"scesp_abone"];
+    [d setInteger:g_selectedAimPart forKey:@"scesp_aim_part"];
 }
 static void loadSettings() {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -110,8 +126,8 @@ static void loadSettings() {
     g_set.aimSpeed = [d floatForKey:@"scesp_aspd"]; if (g_set.aimSpeed < 2.0f) g_set.aimSpeed = 14.0f;
     g_set.drawFov = [d objectForKey:@"scesp_dfov"] ? [d boolForKey:@"scesp_dfov"] : true;
     g_set.dmg = [d objectForKey:@"scesp_dmgnum"] ? [d boolForKey:@"scesp_dmgnum"] : true;
-    g_set.dmgMine = [d objectForKey:@"scesp_dmine"] ? [d boolForKey:@"scesp_dmine"] : true;
-    g_set.aimBone = (int)[d integerForKey:@"scesp_abone"]; if (g_set.aimBone < 0 || g_set.aimBone > 4) g_set.aimBone = 0;
+    g_selectedAimPart = (int)[d integerForKey:@"scesp_aim_part"];
+    if (g_selectedAimPart < 0 || g_selectedAimPart >= kAimPartCount) g_selectedAimPart = kAimHead;
 }
 
 // ---- il2cpp API ------------------------------------------------------------------------
@@ -670,7 +686,11 @@ static void probeStep(void *me, void *aim, float cy, float cp, double now) {
     g_probePhase = 0;
 }
 static double g_aimLastW = 0;
-struct AimTg { V3 pos; void *id; };
+struct AimTg {
+    V3 pos; void *id;
+    V3 partPos[kAimPartCount];
+    uint8_t partCount[kAimPartCount];
+};
 static void *g_lockId = nullptr;         // target we are currently locked on (sticky, so we do not flick between bots)
 // Runs on EVERY tick with the real elapsed time: first-order approach to the target, so the motion does not depend
 // on the tick rate (the run loop can wake several times per frame). Small cap on the angular speed = no snapping.
@@ -694,6 +714,7 @@ static void aimStep(void *me, void *aim, float dyaw, float dpit, float dt) {
 // ---- scene scan ------------------------------------------------------------------------
 struct PlayerInfo {
     std::vector<char> skip;         // per bone: junk bone (by name), never drawn
+    std::vector<int8_t> part;        // cached body region for aim-point selection
     uint32_t obj = 0;
     std::vector<uint32_t> smr;      // SkinnedMeshRenderer handles belonging to this player
     std::vector<uint32_t> anim;     // Animator handles belonging to this player
@@ -725,6 +746,45 @@ static bool boneNameSkip(void *tr) {
     if (g_skipCache.size() > 8192) g_skipCache.clear();
     g_skipCache[tr] = skip;
     return skip;
+}
+
+static std::unordered_map<void *, int8_t> g_partCache;
+static int8_t boneAimPart(void *tr) {
+    auto cached = g_partCache.find(tr);
+    if (cached != g_partCache.end()) return cached->second;
+    int8_t part = -1;
+    if (mi_get_name && il2_str_chars && il2_str_len) {
+        void *str = inv(mi_get_name, tr, nullptr);
+        if (str) {
+            int len = il2_str_len(str);
+            const uint16_t *ch = il2_str_chars(str);
+            char name[96]; int n = len < 95 ? len : 95; if (n < 0) n = 0;
+            for (int i = 0; i < n; i++) name[i] = ch[i] < 128 ? (char)tolower(ch[i]) : '?';
+            name[n] = 0;
+            if (strstr(name, "head")) part = kAimHead;
+            else if (strstr(name, "neck")) part = kAimNeck;
+            else if (strstr(name, "foot") || strstr(name, "ankle") || strstr(name, "toe")) part = kAimFoot;
+            else if (strstr(name, "pelvis") || strstr(name, "hip")) part = kAimPelvis;
+            else if (strstr(name, "arm") || strstr(name, "shoulder") || strstr(name, "elbow") || strstr(name, "wrist") || strstr(name, "hand")) part = kAimArm;
+            else if (strstr(name, "leg") || strstr(name, "thigh") || strstr(name, "knee") || strstr(name, "calf")) part = kAimLeg;
+            else if (strstr(name, "chest") || strstr(name, "rib") || strstr(name, "upperchest") || strstr(name, "spine2") || strstr(name, "spine_02") || strstr(name, "torso")) part = kAimChest;
+            else if (strstr(name, "stomach") || strstr(name, "abdomen") || strstr(name, "spine1") || strstr(name, "spine_01") || strstr(name, "spine")) part = kAimStomach;
+        }
+    }
+    if (g_partCache.size() > 8192) g_partCache.clear();
+    g_partCache[tr] = part;
+    return part;
+}
+
+static char fallbackAimPart(float relativeY, float bodyHeight) {
+    float h = fmaxf(1.2f, bodyHeight);
+    if (relativeY > h * 0.84f) return kAimHead;
+    if (relativeY > h * 0.73f) return kAimNeck;
+    if (relativeY > h * 0.54f) return kAimChest;
+    if (relativeY > h * 0.37f) return kAimStomach;
+    if (relativeY > h * 0.23f) return kAimPelvis;
+    if (relativeY > h * 0.07f) return kAimLeg;
+    return kAimFoot;
 }
 
 static void freeInfo(PlayerInfo &p) {
@@ -826,6 +886,7 @@ static void rescan(bool wantBones) {
                 bp.push_back(bones[b]);
                 fresh[i].bone.push_back(bones[b] ? il2_gc_new(bones[b], 0) : 0);
                 fresh[i].skip.push_back(bones[b] ? (char)boneNameSkip(bones[b]) : 1);
+                fresh[i].part.push_back(bones[b] ? boneAimPart(bones[b]) : (int8_t)-1);
             }
             for (uintptr_t b = 0; b < bestN; b++) {
                 int pi = -1;
@@ -1460,22 +1521,6 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
     k.y += 28;
 }
 
-static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items, int sel, id tgt, SEL act) {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, k.y, k.w - 20, 14)];
-    l.text = title; l.textColor = NL_TEXT; l.font = [UIFont systemFontOfSize:11];
-    UISegmentedControl *sc = [[UISegmentedControl alloc] initWithItems:items];
-    sc.frame = CGRectMake(10, k.y + 16, k.w - 20, 24);
-    sc.selectedSegmentIndex = sel;
-    sc.selectedSegmentTintColor = NL_ACCENT;
-    sc.backgroundColor = NL_OFF;
-    [sc setTitleTextAttributes:@{ NSFontAttributeName: [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold], NSForegroundColorAttributeName: NL_DIM } forState:UIControlStateNormal];
-    [sc setTitleTextAttributes:@{ NSFontAttributeName: [UIFont systemFontOfSize:9 weight:UIFontWeightBold], NSForegroundColorAttributeName: UIColor.whiteColor } forState:UIControlStateSelected];
-    [sc addTarget:tgt action:act forControlEvents:UIControlEventValueChanged];
-    [k.v addSubview:l]; [k.v addSubview:sc];
-    k.y += 46;
-    return sc;
-}
-
 @interface SCESPDriver : NSObject
 - (void)tick;
 @end
@@ -1490,6 +1535,8 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
     UILabel *_lwLabel, *_hdLabel, *_fovLabel, *_spdLabel, *_aimInfo, *_tabTitle;
     CAShapeLayer *_fovRing;
     NSMutableArray *_pages, *_tabs, *_swatches, *_dmgLabels;
+    NSMutableArray *_aimPartButtons;
+    UILabel *_aimPartInfo;
     int _frame, _vfy;
     void *_diagR;
     double _lastTick, _lastScan;
@@ -1587,7 +1634,6 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
         NLCard a = nlCard(pg, @"Aim lock", 0, 0, CW);
         nlToggle(a, @"Enabled", 8, g_set.aim, self, @selector(swChanged:));
         nlToggle(a, @"Draw FOV", 15, g_set.drawFov, self, @selector(swChanged:));
-        nlSegment(a, @"Aim at", @[@"Head", @"Neck", @"Chest", @"Body", @"Near"], g_set.aimBone, self, @selector(aimBoneChanged:));
         _fovLabel = nlSlider(a, @"FOV", 13, 5, 90, g_set.fov, self, @selector(slChanged:));
         _spdLabel = nlSlider(a, @"Speed", 14, 4, 40, g_set.aimSpeed, self, @selector(slChanged:));
         nlEnd(a);
@@ -1596,7 +1642,97 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
         nlButton(b, @"Use dump fields", self, @selector(dumpFieldsTapped));
         _aimInfo = nlInfo(b, 44, 9);
         nlEnd(b);
-        pg.contentSize = CGSizeMake(PW, fmax(nlMaxY(a.v.frame), nlMaxY(b.v.frame)) + 8);
+
+        // T-side agent profile: each hit zone is an actual button that selects an aim bone region.
+        CGFloat previewY = fmax(nlMaxY(a.v.frame), nlMaxY(b.v.frame)) + 8;
+        NLCard preview = nlCard(pg, @"T-SIDE / TARGET POINT", 0, previewY, PW);
+        UILabel *profile = [[UILabel alloc] initWithFrame:CGRectMake(PW - 100, 8, 88, 14)];
+        profile.text = @"PROFILE VIEW"; profile.textAlignment = NSTextAlignmentRight;
+        profile.textColor = NL_DIM; profile.font = [UIFont systemFontOfSize:8 weight:UIFontWeightBold];
+        [preview.v addSubview:profile];
+
+        CGFloat bodyX = PW * 0.52f;
+        UIBezierPath *figure = [UIBezierPath bezierPath];
+        [figure moveToPoint:CGPointMake(bodyX - 1, 69)];
+        [figure addCurveToPoint:CGPointMake(bodyX + 1, 143) controlPoint1:CGPointMake(bodyX - 9, 91) controlPoint2:CGPointMake(bodyX - 7, 123)];
+        [figure moveToPoint:CGPointMake(bodyX - 2, 142)];
+        [figure addLineToPoint:CGPointMake(bodyX - 14, 176)];
+        [figure addLineToPoint:CGPointMake(bodyX - 16, 209)];
+        [figure moveToPoint:CGPointMake(bodyX + 2, 143)];
+        [figure addLineToPoint:CGPointMake(bodyX + 19, 176)];
+        [figure addLineToPoint:CGPointMake(bodyX + 24, 209)];
+        CAShapeLayer *figureLayer = [CAShapeLayer layer];
+        figureLayer.path = figure.CGPath; figureLayer.strokeColor = NL_DIM.CGColor;
+        figureLayer.fillColor = UIColor.clearColor.CGColor; figureLayer.lineWidth = 14;
+        figureLayer.lineCap = kCALineCapRound; figureLayer.lineJoin = kCALineJoinRound;
+        [preview.v.layer addSublayer:figureLayer];
+
+        UIBezierPath *vest = [UIBezierPath bezierPath];
+        [vest moveToPoint:CGPointMake(bodyX - 10, 77)];
+        [vest addLineToPoint:CGPointMake(bodyX + 8, 77)];
+        [vest addLineToPoint:CGPointMake(bodyX + 13, 105)];
+        [vest addLineToPoint:CGPointMake(bodyX + 9, 140)];
+        [vest addLineToPoint:CGPointMake(bodyX - 10, 140)];
+        [vest addLineToPoint:CGPointMake(bodyX - 14, 105)];
+        [vest closePath];
+        CAShapeLayer *vestLayer = [CAShapeLayer layer]; vestLayer.path = vest.CGPath;
+        vestLayer.fillColor = nlRGB(39, 51, 67).CGColor;
+        vestLayer.strokeColor = NL_BORDER.CGColor; vestLayer.lineWidth = 1;
+        [preview.v.layer addSublayer:vestLayer];
+        UIBezierPath *armPath = [UIBezierPath bezierPath];
+        [armPath moveToPoint:CGPointMake(bodyX - 7, 84)];
+        [armPath addLineToPoint:CGPointMake(bodyX + 13, 106)];
+        [armPath addLineToPoint:CGPointMake(bodyX + 16, 132)];
+        CAShapeLayer *armLayer = [CAShapeLayer layer]; armLayer.path = armPath.CGPath;
+        armLayer.strokeColor = NL_DIM.CGColor; armLayer.fillColor = UIColor.clearColor.CGColor;
+        armLayer.lineWidth = 9; armLayer.lineCap = kCALineCapRound; armLayer.lineJoin = kCALineJoinRound;
+        [preview.v.layer addSublayer:armLayer];
+        UIBezierPath *headProfile = [UIBezierPath bezierPath];
+        [headProfile moveToPoint:CGPointMake(bodyX - 10, 64)];
+        [headProfile addCurveToPoint:CGPointMake(bodyX + 10, 44) controlPoint1:CGPointMake(bodyX - 13, 43) controlPoint2:CGPointMake(bodyX - 1, 35)];
+        [headProfile addCurveToPoint:CGPointMake(bodyX + 13, 55) controlPoint1:CGPointMake(bodyX + 17, 46) controlPoint2:CGPointMake(bodyX + 19, 51)];
+        [headProfile addLineToPoint:CGPointMake(bodyX + 18, 59)];
+        [headProfile addLineToPoint:CGPointMake(bodyX + 11, 62)];
+        [headProfile addCurveToPoint:CGPointMake(bodyX - 10, 64) controlPoint1:CGPointMake(bodyX + 5, 71) controlPoint2:CGPointMake(bodyX - 5, 70)];
+        [headProfile closePath];
+        CAShapeLayer *headLayer = [CAShapeLayer layer]; headLayer.path = headProfile.CGPath;
+        headLayer.fillColor = NL_DIM.CGColor; [preview.v.layer addSublayer:headLayer];
+        UIBezierPath *chestMark = [UIBezierPath bezierPath];
+        [chestMark moveToPoint:CGPointMake(bodyX - 8, 91)]; [chestMark addLineToPoint:CGPointMake(bodyX + 7, 91)];
+        CAShapeLayer *markLayer = [CAShapeLayer layer]; markLayer.path = chestMark.CGPath;
+        markLayer.strokeColor = NL_ACCENT.CGColor; markLayer.lineWidth = 3; markLayer.lineCap = kCALineCapRound;
+        [preview.v.layer addSublayer:markLayer];
+
+        _aimPartButtons = [NSMutableArray array];
+        const CGRect zones[kAimPartCount] = {
+            { bodyX - 18, 39, 36, 29 },  // head
+            { bodyX - 14, 67, 28, 20 },  // neck
+            { bodyX - 25, 83, 47, 29 },  // chest
+            { bodyX - 24, 108, 46, 27 }, // stomach
+            { bodyX - 23, 132, 45, 25 }, // pelvis
+            { bodyX + 5, 94, 38, 52 },  // arm
+            { bodyX - 25, 157, 54, 52 },// legs
+            { bodyX - 29, 200, 62, 22 } // feet
+        };
+        const char *zoneNames[kAimPartCount] = { "HEAD", "NECK", "CHEST", "ABS", "PELVIS", "ARM", "LEG", "FOOT" };
+        for (int part = 0; part < kAimPartCount; part++) {
+            UIButton *zone = [UIButton buttonWithType:UIButtonTypeCustom];
+            zone.frame = zones[part]; zone.tag = part;
+            zone.layer.cornerRadius = 7; zone.layer.borderWidth = 1;
+            zone.titleLabel.font = [UIFont systemFontOfSize:7 weight:UIFontWeightBold];
+            zone.titleLabel.adjustsFontSizeToFitWidth = YES; zone.titleLabel.minimumScaleFactor = 0.7f;
+            [zone setTitle:[NSString stringWithUTF8String:zoneNames[part]] forState:UIControlStateNormal];
+            [zone setTitleColor:NL_TEXT forState:UIControlStateNormal];
+            [zone addTarget:self action:@selector(aimPartTapped:) forControlEvents:UIControlEventTouchUpInside];
+            [preview.v addSubview:zone]; [_aimPartButtons addObject:zone];
+        }
+        _aimPartInfo = [[UILabel alloc] initWithFrame:CGRectMake(12, 225, PW - 24, 16)];
+        _aimPartInfo.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightSemibold];
+        _aimPartInfo.textColor = NL_ACCENT;
+        [preview.v addSubview:_aimPartInfo];
+        preview.y = 246; nlEnd(preview);
+        [self refreshAimPartPreview];
+        pg.contentSize = CGSizeMake(PW, nlMaxY(preview.v.frame) + 8);
     }
     // --- Visuals ---
     {
@@ -1610,7 +1746,6 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
         nlToggle(a, @"Head dot", 12, g_set.hdot, self, @selector(swChanged:));
         nlToggle(a, @"Health bar", 9, g_set.hp, self, @selector(swChanged:));
         nlToggle(a, @"Damage numbers", 16, g_set.dmg, self, @selector(swChanged:));
-        nlToggle(a, @"Only my hits", 17, g_set.dmgMine, self, @selector(swChanged:));
         nlToggle(a, @"Teammates", 5, g_set.team, self, @selector(swChanged:));
         nlEnd(a);
         NLCard b = nlCard(pg, @"Style", CW + 8, 0, CW);
@@ -1654,6 +1789,21 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
     _tabTitle.text = names[i];
 }
 - (void)tabTapped:(UIButton *)b { [self selectTab:b.tag]; }
+- (void)refreshAimPartPreview {
+    for (UIButton *zone in _aimPartButtons) {
+        BOOL selected = zone.tag == g_selectedAimPart;
+        zone.backgroundColor = selected ? [NL_ACCENT colorWithAlphaComponent:0.34] : [NL_SIDE colorWithAlphaComponent:0.72];
+        zone.layer.borderColor = (selected ? NL_ACCENT : NL_BORDER).CGColor;
+        zone.layer.borderWidth = selected ? 2 : 1;
+    }
+    _aimPartInfo.text = [NSString stringWithFormat:@"AIM TARGET: %@   •   TAP A BODY PART", aimPartTitle(g_selectedAimPart).uppercaseString];
+}
+- (void)aimPartTapped:(UIButton *)b {
+    if (b.tag < 0 || b.tag >= kAimPartCount) return;
+    g_selectedAimPart = (int)b.tag;
+    saveSettings();
+    [self refreshAimPartPreview];
+}
 - (void)colorTapped:(UIButton *)b {
     g_set.color = (int)b.tag; g_dirty = true; saveSettings();
     for (UIButton *sw in _swatches) sw.layer.borderWidth = (sw.tag == b.tag) ? 2 : 0;
@@ -1695,11 +1845,9 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
         case 12: g_set.hdot = s.on; break;
         case 15: g_set.drawFov = s.on; break;
         case 16: g_set.dmg = s.on; if (!s.on) g_pops.clear(); break;
-        case 17: g_set.dmgMine = s.on; g_pops.clear(); break;
     }
     g_dirty = true; saveSettings();
 }
-- (void)aimBoneChanged:(UISegmentedControl *)s { g_set.aimBone = (int)s.selectedSegmentIndex; g_lockId = nullptr; saveSettings(); }
 - (void)segChanged:(UISegmentedControl *)s { g_set.color = (int)s.selectedSegmentIndex; g_dirty = true; saveSettings(); }
 - (void)slChanged:(UISlider *)s {
     if (s.tag == 10) g_set.lw = s.value; else if (s.tag == 13) g_set.fov = s.value; else if (s.tag == 14) g_set.aimSpeed = s.value; else g_set.head = s.value;
@@ -1800,7 +1948,7 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
     void *diagR = nullptr;
 
     if (g_set.on) {
-        if (now - _lastScan > 1.0) { rescan(g_set.skel || g_set.chams || g_set.box); scanNow = true; _lastScan = now; }
+        if (now - _lastScan > 1.0) { rescan(g_set.skel || g_set.chams || g_set.box || g_set.aim); scanNow = true; _lastScan = now; }
         @try {
             void *cam = d_cam_main(mi_cam_main);
             int sw = d_sw(mi_sw), sh = d_sh(mi_sh);
@@ -1809,12 +1957,6 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
                 void *ctr = d_tr(cam, mi_tr);
                 V3 camPos = d_pos(ctr, mi_pos);
                 CGSize vs = _overlay.bounds.size;
-                V3 vf = { 0.f, 0.f, 1.f }; bool haveVf = false;           // normalized view direction (damage attribution + aim point)
-                if (mi_fwd && d_fwd) {
-                    vf = d_fwd(ctr, mi_fwd);
-                    float vl = sqrtf(vf.x * vf.x + vf.y * vf.y + vf.z * vf.z);
-                    if (vl > 1e-4f) { vf.x /= vl; vf.y /= vl; vf.z /= vl; haveVf = true; }
-                }
 
                 struct P { PlayerInfo *pi; void *obj; V3 pos; bool self; };
                 std::vector<P> ps;
@@ -1854,29 +1996,26 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
                     sp.assign(nb, CGPointMake(0, 0)); okp.assign(nb, 0);
                     float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
                     V3 hw = { 0, 0, 0 }; float hy = -1e9f;
-                    V3 hwA = { 0, 0, 0 }; float hyA = -1e9f;               // highest bone that is NOT above head height (aim head point)
-                    V3 nearB = { 0, 0, 0 }; float nearAng = 1e9f;           // bone closest to the crosshair
-                    float rayMin = 1e9f;                                    // closest distance from my view ray to any bone
                     int good = 0;
+                    V3 partSum[kAimPartCount] = {};
+                    int partCount[kAimPartCount] = {};
                     for (size_t b = 0; b < nb; b++) {
                         void *bt = pi.bone[b] ? il2_gc_get(pi.bone[b]) : nullptr;
                         if (!alive(bt)) continue;
                         if (b < pi.skip.size() && pi.skip[b]) continue;
                         V3 w = d_pos(bt, mi_pos);
-                        { float ex = w.x - p.pos.x, ey = w.y - p.pos.y, ez = w.z - p.pos.z;
-                          if (ey < -kBelowFeet || ey > g_set.head + 0.8f || ex * ex + ez * ez > kMaxReach * kMaxReach) continue;
-                          if (ey <= g_set.head + 0.1f && w.y > hyA) { hyA = w.y; hwA = w; } }
-                        if (w.y > hy) { hy = w.y; hw = w; }
-                        if (haveVf) {
-                            float vx = w.x - camPos.x, vy = w.y - camPos.y, vz = w.z - camPos.z;
-                            float tt = vx * vf.x + vy * vf.y + vz * vf.z, l2 = vx * vx + vy * vy + vz * vz;
-                            if (tt > 0.f && l2 > 1e-4f) {
-                                float perp = sqrtf(fmaxf(0.f, l2 - tt * tt));
-                                if (perp < rayMin) rayMin = perp;
-                                float ang = acosf(fmaxf(-1.f, fminf(1.f, tt / sqrtf(l2))));
-                                if (ang < nearAng) { nearAng = ang; nearB = w; }
-                            }
+                        float ex = w.x - p.pos.x, ey = w.y - p.pos.y, ez = w.z - p.pos.z;
+                        if (ey < -kBelowFeet || ey > g_set.head + 0.8f || ex * ex + ez * ez > kMaxReach * kMaxReach) continue;
+                        int region = b < pi.part.size() ? pi.part[b] : -1;
+                        if (region < 0 || region >= kAimPartCount) {
+                            bool lateralArm = ey > 0.48f && ey < g_set.head * 0.78f && (ex * ex + ez * ez) > 0.055f;
+                            region = lateralArm ? kAimArm : fallbackAimPart(ey, g_set.head);
                         }
+                        if (region >= 0 && region < kAimPartCount) {
+                            partSum[region].x += w.x; partSum[region].y += w.y; partSum[region].z += w.z;
+                            partCount[region]++;
+                        }
+                        if (w.y > hy) { hy = w.y; hw = w; }
                         V3 s = d_world2screen(cam, w, mi_w2s);
                         if (s.z <= 0) continue;
                         CGFloat x = s.x / sw * vs.width, y = (1.0 - s.y / sh) * vs.height;
@@ -1892,20 +2031,7 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
                     if (g_set.dmg && hpOk) {
                         if (g_hpPrev.size() > 128) g_hpPrev.clear();
                         auto it = g_hpPrev.find(p.obj);
-                        bool mine = true;
-                        if (g_set.dmgMine) {            // damage must come through MY crosshair: my view ray passes through the bot
-                            float rm = rayMin;
-                            if (rm > 1e8f && haveVf) {  // no bones: test the pivot-based body points instead
-                                for (int k = 0; k < 3; k++) {
-                                    float yy = p.pos.y + g_set.head * (0.25f + 0.35f * k);
-                                    float vx = p.pos.x - camPos.x, vy = yy - camPos.y, vz = p.pos.z - camPos.z;
-                                    float tt = vx * vf.x + vy * vf.y + vz * vf.z, l2 = vx * vx + vy * vy + vz * vz;
-                                    if (tt > 0.f) rm = fminf(rm, sqrtf(fmaxf(0.f, l2 - tt * tt)));
-                                }
-                            }
-                            mine = haveVf && rm < kDmgRayTol;
-                        }
-                        if (it != g_hpPrev.end() && hpv < it->second - 0.5f && it->second < 1000.f && mine) {
+                        if (it != g_hpPrev.end() && hpv < it->second - 0.5f && it->second < 1000.f) {
                             V3 hp3 = hy > -1e8f ? hw : V3{ p.pos.x, p.pos.y + 1.6f, p.pos.z };
                             dmgSpawn(p.obj, { hp3.x, hp3.y + 0.15f, hp3.z }, it->second - hpv, now);
                         }
@@ -1916,17 +2042,17 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
                     {
                         bool dead = hpOk && hpv <= 0.f;                       // never lock on corpses
                         if (!dead && botObj) {                                // aim lock targets bots only
-                            V3 headPt = hyA > -1e8f ? hwA : V3{ p.pos.x, p.pos.y + g_set.head - 0.12f, p.pos.z };
-                            float stand = fmaxf(0.8f, headPt.y - p.pos.y);     // feet -> head, follows crouching
-                            V3 ap = headPt;
-                            switch (g_set.aimBone) {
-                                case 1: ap = { headPt.x, headPt.y - 0.2f, headPt.z }; break;                                   // neck
-                                case 2: ap = { p.pos.x, p.pos.y + stand * 0.72f, p.pos.z }; break;                             // chest
-                                case 3: ap = { p.pos.x, p.pos.y + stand * 0.50f, p.pos.z }; break;                             // body
-                                case 4: ap = nearAng < 1e8f ? nearB : V3{ p.pos.x, p.pos.y + stand * 0.72f, p.pos.z }; break;  // nearest bone
-                                default: break;
+                            AimTg target{};
+                            target.pos = hy > -1e8f ? hw : V3{ p.pos.x, p.pos.y + 1.6f, p.pos.z };
+                            target.id = p.obj;
+                            for (int q = 0; q < kAimPartCount; q++) {
+                                if (partCount[q] > 0) {
+                                    float invCount = 1.0f / (float)partCount[q];
+                                    target.partPos[q] = { partSum[q].x * invCount, partSum[q].y * invCount, partSum[q].z * invCount };
+                                    target.partCount[q] = (uint8_t)fminf(255.f, (float)partCount[q]);
+                                }
                             }
-                            tg.push_back({ ap, p.obj });
+                            tg.push_back(target);
                         }
                     }
                     bool haveBones = good >= 6;
@@ -2040,14 +2166,17 @@ static UISegmentedControl *nlSegment(NLCard &k, NSString *title, NSArray *items,
                         g_aimLastW = now;
                         float best = 1e9f, dyB = 0, dpB = 0; bool got = false; void *bestId = nullptr;
                         for (auto &t : tg) {
-                            float dx = t.pos.x - camPos.x, dy = t.pos.y - camPos.y, dz = t.pos.z - camPos.z;
+                            V3 targetPos = t.pos;
+                            if (g_selectedAimPart >= 0 && g_selectedAimPart < kAimPartCount && t.partCount[g_selectedAimPart] > 0)
+                                targetPos = t.partPos[g_selectedAimPart];
+                            float dx = targetPos.x - camPos.x, dy = targetPos.y - camPos.y, dz = targetPos.z - camPos.z;
                             float len = sqrtf(dx * dx + dy * dy + dz * dz);
                             if (len < 0.5f) continue;
                             float ey = wrap180(atan2f(dx, dz) * 57.29578f - curYaw), ep = -asinf(dy / len) * 57.29578f - curPit;
                             float e = acosf(fmaxf(-1.f, fminf(1.f, (f.x * dx + f.y * dy + f.z * dz) / len))) * 57.29578f;   // true angle to the view direction
                             bool cur = t.id && t.id == g_lockId;
-                            if (e > g_set.fov * (cur ? 1.15f : 1.0f)) continue;      // hysteresis: a locked target may drift out a bit further
-                            float score = cur ? e * 0.8f : e;                      // sticky: only switch when another bot is clearly closer
+                            if (e > g_set.fov * (cur ? 1.3f : 1.0f)) continue;      // hysteresis: a locked target may drift out a bit further
+                            float score = cur ? e * 0.55f : e;                      // sticky: only switch when another bot is clearly closer
                             if (score < best) { best = score; dyB = ey; dpB = ep; got = true; bestId = t.id; }
                         }
                         g_lockId = got ? bestId : nullptr;
