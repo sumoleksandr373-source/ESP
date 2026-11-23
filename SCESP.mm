@@ -77,6 +77,7 @@ struct Settings {
     float aimSpeed = 14.0f; // aim smoothing: higher = snappier (1/s)
     bool drawFov = true;    // draw the aim capture outline on screen
     bool dmg = true;        // floating damage numbers
+    bool dmgMine = true;    // damage numbers only for hits taken while the target is under my crosshair
 };
 static Settings g_set;
 static bool g_dirty = true;
@@ -107,6 +108,7 @@ static void saveSettings() {
     [d setFloat:g_set.aimSpeed forKey:@"scesp_aspd"];
     [d setBool:g_set.drawFov forKey:@"scesp_dfov"];
     [d setBool:g_set.dmg forKey:@"scesp_dmgnum"];
+    [d setBool:g_set.dmgMine forKey:@"scesp_dmgmine"];
     [d setInteger:g_selectedAimPart forKey:@"scesp_aim_part"];
 }
 static void loadSettings() {
@@ -127,6 +129,7 @@ static void loadSettings() {
     g_set.aimSpeed = [d floatForKey:@"scesp_aspd"]; if (g_set.aimSpeed < 2.0f) g_set.aimSpeed = 14.0f;
     g_set.drawFov = [d objectForKey:@"scesp_dfov"] ? [d boolForKey:@"scesp_dfov"] : true;
     g_set.dmg = [d objectForKey:@"scesp_dmgnum"] ? [d boolForKey:@"scesp_dmgnum"] : true;
+    g_set.dmgMine = [d objectForKey:@"scesp_dmgmine"] ? [d boolForKey:@"scesp_dmgmine"] : true;
     g_selectedAimPart = (int)[d integerForKey:@"scesp_aim_part"];
     if (g_selectedAimPart < 0 || g_selectedAimPart >= kAimPartCount) g_selectedAimPart = kAimHead;
 }
@@ -1775,6 +1778,7 @@ static SCNNode *buildAgentModel() {
         nlToggle(a, @"Head dot", 12, g_set.hdot, self, @selector(swChanged:));
         nlToggle(a, @"Health bar", 9, g_set.hp, self, @selector(swChanged:));
         nlToggle(a, @"Damage numbers", 16, g_set.dmg, self, @selector(swChanged:));
+        nlToggle(a, @"My damage only", 17, g_set.dmgMine, self, @selector(swChanged:));
         nlToggle(a, @"Teammates", 5, g_set.team, self, @selector(swChanged:));
         nlEnd(a);
         NLCard b = nlCard(pg, @"Style", CW + 8, 0, CW);
@@ -1903,6 +1907,7 @@ static SCNNode *buildAgentModel() {
         case 12: g_set.hdot = s.on; break;
         case 15: g_set.drawFov = s.on; break;
         case 16: g_set.dmg = s.on; if (!s.on) g_pops.clear(); break;
+        case 17: g_set.dmgMine = s.on; break;
     }
     g_dirty = true; saveSettings();
 }
@@ -2089,7 +2094,19 @@ static SCNNode *buildAgentModel() {
                     if (g_set.dmg && hpOk) {
                         if (g_hpPrev.size() > 128) g_hpPrev.clear();
                         auto it = g_hpPrev.find(p.obj);
-                        if (it != g_hpPrev.end() && hpv < it->second - 0.5f && it->second < 1000.f) {
+                        // "my damage only": the game gives no attacker, so a drop only counts while this character
+                        // is under my crosshair (screen box around the bones, padded, must contain the view centre).
+                        // Hits a teammate lands on someone I am not looking at are ignored.
+                        bool mine = true;
+                        if (g_set.dmgMine) {
+                            mine = false;
+                            if (good >= 2 && maxX > minX) {
+                                CGFloat padX = fmax(18.0, (maxX - minX) * 0.15), padY = fmax(18.0, (maxY - minY) * 0.10);
+                                CGFloat cx = vs.width * 0.5, cy = vs.height * 0.5;
+                                mine = cx >= minX - padX && cx <= maxX + padX && cy >= minY - padY && cy <= maxY + padY;
+                            }
+                        }
+                        if (mine && it != g_hpPrev.end() && hpv < it->second - 0.5f && it->second < 1000.f) {
                             V3 hp3 = hy > -1e8f ? hw : V3{ p.pos.x, p.pos.y + 1.6f, p.pos.z };
                             dmgSpawn(p.obj, { hp3.x, hp3.y + 0.15f, hp3.z }, it->second - hpv, now);
                         }
