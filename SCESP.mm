@@ -1602,7 +1602,10 @@ static SCNNode *buildAgentModel() {
         if (![s isKindOfClass:UIWindowScene.class]) continue;
         for (UIWindow *w in ((UIWindowScene *)s).windows) if (w.isKeyWindow) return w;
     }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return UIApplication.sharedApplication.windows.firstObject;
+#pragma clang diagnostic pop
 }
 
 - (void)addSwitch:(NSString *)title col:(int)col row:(int)row tag:(int)tag on:(BOOL)on {
@@ -1668,7 +1671,10 @@ static SCNNode *buildAgentModel() {
         UIButton *tb = [UIButton buttonWithType:UIButtonTypeCustom];
         tb.frame = CGRectMake(0, 62 + i * 34, SB, 32); tb.tag = i;
         tb.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
         tb.contentEdgeInsets = UIEdgeInsetsMake(0, 36, 0, 0);
+#pragma clang diagnostic pop
         tb.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
         [tb setTitle:names[i] forState:UIControlStateNormal];
         UIImageView *ic = [[UIImageView alloc] initWithFrame:CGRectMake(14, 8, 16, 16)];
