@@ -17,6 +17,7 @@
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <SceneKit/SceneKit.h>
 #include <dlfcn.h>
 #include <stdint.h>
 #include <string.h>
@@ -1521,6 +1522,59 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
     k.y += 28;
 }
 
+// ---- T-side agent: procedural 3D model (SceneKit). Every aim region is its own node named "aim_<AimPart>". ----
+static SCNNode *aimMesh(SCNGeometry *g, UIColor *c, int part, float x, float y, float z) {
+    SCNMaterial *m = [SCNMaterial material];
+    m.diffuse.contents = c; m.specular.contents = [UIColor colorWithWhite:0.25 alpha:1]; m.lightingModelName = SCNLightingModelBlinn;
+    g.materials = @[m];
+    SCNNode *n = [SCNNode nodeWithGeometry:g];
+    n.position = SCNVector3Make(x, y, z);
+    if (part >= 0) n.name = [NSString stringWithFormat:@"aim_%d", part];
+    return n;
+}
+static UIColor *aimRGB(int r, int g, int b) { return [UIColor colorWithRed:r / 255.0 green:g / 255.0 blue:b / 255.0 alpha:1]; }
+static SCNNode *buildAgentModel() {
+    SCNNode *root = [SCNNode node];
+    UIColor *black = aimRGB(28, 30, 38), *red = aimRGB(196, 44, 38), *vest = aimRGB(86, 92, 106), *pants = aimRGB(48, 54, 66),
+            *skin = aimRGB(214, 140, 92), *wrap = aimRGB(226, 226, 230), *gunc = aimRGB(34, 36, 40);
+    // head: balaclava + red stripes + eye slit
+    SCNNode *head = aimMesh([SCNSphere sphereWithRadius:0.118], black, kAimHead, 0, 1.72, 0);
+    head.scale = SCNVector3Make(0.95, 1.12, 1.0);
+    for (int s = -1; s <= 1; s += 2) {
+        SCNNode *st = aimMesh([SCNBox boxWithWidth:0.014 height:0.2 length:0.012 chamferRadius:0], red, -1, s * 0.05, 0.0, 0.108);
+        st.name = [NSString stringWithFormat:@"aim_%d", kAimHead]; [head addChildNode:st];
+    }
+    SCNNode *slit = aimMesh([SCNBox boxWithWidth:0.115 height:0.032 length:0.01 chamferRadius:0], skin, -1, 0, 0.02, 0.112);
+    slit.name = [NSString stringWithFormat:@"aim_%d", kAimHead]; [head addChildNode:slit];
+    [root addChildNode:head];
+    // neck (red hood collar)
+    [root addChildNode:aimMesh([SCNCylinder cylinderWithRadius:0.075 height:0.12], red, kAimNeck, 0, 1.585, 0)];
+    // torso
+    [root addChildNode:aimMesh([SCNBox boxWithWidth:0.42 height:0.30 length:0.25 chamferRadius:0.03], vest, kAimChest, 0, 1.40, 0)];
+    [root addChildNode:aimMesh([SCNBox boxWithWidth:0.36 height:0.22 length:0.22 chamferRadius:0.02], red, kAimStomach, 0, 1.15, 0)];
+    [root addChildNode:aimMesh([SCNBox boxWithWidth:0.38 height:0.20 length:0.23 chamferRadius:0.02], pants, kAimPelvis, 0, 0.94, 0)];
+    // arms: upper arm hangs, forearm points forward to the rifle
+    for (int s = -1; s <= 1; s += 2) {
+        SCNNode *up = aimMesh([SCNCapsule capsuleWithCapRadius:0.058 height:0.40], skin, kAimArm, s * 0.285, 1.33, 0.02);
+        up.eulerAngles = SCNVector3Make(0, 0, -s * 0.10); [root addChildNode:up];
+        SCNNode *fore = aimMesh([SCNCapsule capsuleWithCapRadius:0.05 height:0.36], skin, kAimArm, s * 0.21, 1.14, 0.17);
+        fore.eulerAngles = SCNVector3Make(1.25, 0, 0); [root addChildNode:fore];
+        SCNNode *w = aimMesh([SCNCylinder cylinderWithRadius:0.056 height:0.09], wrap, kAimArm, s * 0.21, 1.10, 0.31);
+        w.eulerAngles = SCNVector3Make(1.25, 0, 0); [root addChildNode:w];
+        // red shirt sleeve cap on the shoulder
+        [root addChildNode:aimMesh([SCNSphere sphereWithRadius:0.075], red, kAimArm, s * 0.265, 1.50, 0.0)];
+    }
+    // legs + feet
+    for (int s = -1; s <= 1; s += 2) {
+        [root addChildNode:aimMesh([SCNCapsule capsuleWithCapRadius:0.085 height:0.84], pants, kAimLeg, s * 0.105, 0.47, 0)];
+        [root addChildNode:aimMesh([SCNBox boxWithWidth:0.13 height:0.08 length:0.30 chamferRadius:0.03], black, kAimFoot, s * 0.105, 0.04, 0.06)];
+    }
+    // rifle (decor, no aim part: hit test ignores it)
+    [root addChildNode:aimMesh([SCNBox boxWithWidth:0.06 height:0.09 length:0.95 chamferRadius:0.01], gunc, -1, 0.04, 1.12, 0.36)];
+    [root addChildNode:aimMesh([SCNBox boxWithWidth:0.05 height:0.17 length:0.07 chamferRadius:0.005], gunc, -1, 0.04, 0.99, 0.30)];
+    return root;
+}
+
 @interface SCESPDriver : NSObject
 - (void)tick;
 @end
@@ -1535,7 +1589,8 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
     UILabel *_lwLabel, *_hdLabel, *_fovLabel, *_spdLabel, *_aimInfo, *_tabTitle;
     CAShapeLayer *_fovRing;
     NSMutableArray *_pages, *_tabs, *_swatches, *_dmgLabels;
-    NSMutableArray *_aimPartButtons;
+    NSMutableArray *_aimPartButtons, *_aimChipButtons;
+    SCNView *_agentView; SCNNode *_agentRoot;
     UILabel *_aimPartInfo;
     int _frame, _vfy;
     void *_diagR;
@@ -1643,94 +1698,62 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
         _aimInfo = nlInfo(b, 44, 9);
         nlEnd(b);
 
-        // T-side agent profile: each hit zone is an actual button that selects an aim bone region.
+        // T-side agent preview: 3D model, tap a body part to choose the aim region, drag or use the arrows to rotate.
         CGFloat previewY = fmax(nlMaxY(a.v.frame), nlMaxY(b.v.frame)) + 8;
         NLCard preview = nlCard(pg, @"T-SIDE / TARGET POINT", 0, previewY, PW);
-        UILabel *profile = [[UILabel alloc] initWithFrame:CGRectMake(PW - 100, 8, 88, 14)];
-        profile.text = @"PROFILE VIEW"; profile.textAlignment = NSTextAlignmentRight;
-        profile.textColor = NL_DIM; profile.font = [UIFont systemFontOfSize:8 weight:UIFontWeightBold];
-        [preview.v addSubview:profile];
-
-        CGFloat bodyX = PW * 0.52f;
-        UIBezierPath *figure = [UIBezierPath bezierPath];
-        [figure moveToPoint:CGPointMake(bodyX - 1, 69)];
-        [figure addCurveToPoint:CGPointMake(bodyX + 1, 143) controlPoint1:CGPointMake(bodyX - 9, 91) controlPoint2:CGPointMake(bodyX - 7, 123)];
-        [figure moveToPoint:CGPointMake(bodyX - 2, 142)];
-        [figure addLineToPoint:CGPointMake(bodyX - 14, 176)];
-        [figure addLineToPoint:CGPointMake(bodyX - 16, 209)];
-        [figure moveToPoint:CGPointMake(bodyX + 2, 143)];
-        [figure addLineToPoint:CGPointMake(bodyX + 19, 176)];
-        [figure addLineToPoint:CGPointMake(bodyX + 24, 209)];
-        CAShapeLayer *figureLayer = [CAShapeLayer layer];
-        figureLayer.path = figure.CGPath; figureLayer.strokeColor = NL_DIM.CGColor;
-        figureLayer.fillColor = UIColor.clearColor.CGColor; figureLayer.lineWidth = 14;
-        figureLayer.lineCap = kCALineCapRound; figureLayer.lineJoin = kCALineJoinRound;
-        [preview.v.layer addSublayer:figureLayer];
-
-        UIBezierPath *vest = [UIBezierPath bezierPath];
-        [vest moveToPoint:CGPointMake(bodyX - 10, 77)];
-        [vest addLineToPoint:CGPointMake(bodyX + 8, 77)];
-        [vest addLineToPoint:CGPointMake(bodyX + 13, 105)];
-        [vest addLineToPoint:CGPointMake(bodyX + 9, 140)];
-        [vest addLineToPoint:CGPointMake(bodyX - 10, 140)];
-        [vest addLineToPoint:CGPointMake(bodyX - 14, 105)];
-        [vest closePath];
-        CAShapeLayer *vestLayer = [CAShapeLayer layer]; vestLayer.path = vest.CGPath;
-        vestLayer.fillColor = nlRGB(39, 51, 67).CGColor;
-        vestLayer.strokeColor = NL_BORDER.CGColor; vestLayer.lineWidth = 1;
-        [preview.v.layer addSublayer:vestLayer];
-        UIBezierPath *armPath = [UIBezierPath bezierPath];
-        [armPath moveToPoint:CGPointMake(bodyX - 7, 84)];
-        [armPath addLineToPoint:CGPointMake(bodyX + 13, 106)];
-        [armPath addLineToPoint:CGPointMake(bodyX + 16, 132)];
-        CAShapeLayer *armLayer = [CAShapeLayer layer]; armLayer.path = armPath.CGPath;
-        armLayer.strokeColor = NL_DIM.CGColor; armLayer.fillColor = UIColor.clearColor.CGColor;
-        armLayer.lineWidth = 9; armLayer.lineCap = kCALineCapRound; armLayer.lineJoin = kCALineJoinRound;
-        [preview.v.layer addSublayer:armLayer];
-        UIBezierPath *headProfile = [UIBezierPath bezierPath];
-        [headProfile moveToPoint:CGPointMake(bodyX - 10, 64)];
-        [headProfile addCurveToPoint:CGPointMake(bodyX + 10, 44) controlPoint1:CGPointMake(bodyX - 13, 43) controlPoint2:CGPointMake(bodyX - 1, 35)];
-        [headProfile addCurveToPoint:CGPointMake(bodyX + 13, 55) controlPoint1:CGPointMake(bodyX + 17, 46) controlPoint2:CGPointMake(bodyX + 19, 51)];
-        [headProfile addLineToPoint:CGPointMake(bodyX + 18, 59)];
-        [headProfile addLineToPoint:CGPointMake(bodyX + 11, 62)];
-        [headProfile addCurveToPoint:CGPointMake(bodyX - 10, 64) controlPoint1:CGPointMake(bodyX + 5, 71) controlPoint2:CGPointMake(bodyX - 5, 70)];
-        [headProfile closePath];
-        CAShapeLayer *headLayer = [CAShapeLayer layer]; headLayer.path = headProfile.CGPath;
-        headLayer.fillColor = NL_DIM.CGColor; [preview.v.layer addSublayer:headLayer];
-        UIBezierPath *chestMark = [UIBezierPath bezierPath];
-        [chestMark moveToPoint:CGPointMake(bodyX - 8, 91)]; [chestMark addLineToPoint:CGPointMake(bodyX + 7, 91)];
-        CAShapeLayer *markLayer = [CAShapeLayer layer]; markLayer.path = chestMark.CGPath;
-        markLayer.strokeColor = NL_ACCENT.CGColor; markLayer.lineWidth = 3; markLayer.lineCap = kCALineCapRound;
-        [preview.v.layer addSublayer:markLayer];
-
-        _aimPartButtons = [NSMutableArray array];
-        const CGRect zones[kAimPartCount] = {
-            { bodyX - 18, 39, 36, 29 },  // head
-            { bodyX - 14, 67, 28, 20 },  // neck
-            { bodyX - 25, 83, 47, 29 },  // chest
-            { bodyX - 24, 108, 46, 27 }, // stomach
-            { bodyX - 23, 132, 45, 25 }, // pelvis
-            { bodyX + 5, 94, 38, 52 },  // arm
-            { bodyX - 25, 157, 54, 52 },// legs
-            { bodyX - 29, 200, 62, 22 } // feet
-        };
-        const char *zoneNames[kAimPartCount] = { "HEAD", "NECK", "CHEST", "ABS", "PELVIS", "ARM", "LEG", "FOOT" };
-        for (int part = 0; part < kAimPartCount; part++) {
-            UIButton *zone = [UIButton buttonWithType:UIButtonTypeCustom];
-            zone.frame = zones[part]; zone.tag = part;
-            zone.layer.cornerRadius = 7; zone.layer.borderWidth = 1;
-            zone.titleLabel.font = [UIFont systemFontOfSize:7 weight:UIFontWeightBold];
-            zone.titleLabel.adjustsFontSizeToFitWidth = YES; zone.titleLabel.minimumScaleFactor = 0.7f;
-            [zone setTitle:[NSString stringWithUTF8String:zoneNames[part]] forState:UIControlStateNormal];
-            [zone setTitleColor:NL_TEXT forState:UIControlStateNormal];
-            [zone addTarget:self action:@selector(aimPartTapped:) forControlEvents:UIControlEventTouchUpInside];
-            [preview.v addSubview:zone]; [_aimPartButtons addObject:zone];
+        const CGFloat VW = 190, VH = 250, VX = 10, VY = 28;
+        _agentView = [[SCNView alloc] initWithFrame:CGRectMake(VX, VY, VW, VH)];
+        _agentView.layer.cornerRadius = 8; _agentView.clipsToBounds = YES;
+        _agentView.layer.borderWidth = 1; _agentView.layer.borderColor = NL_BORDER.CGColor;
+        _agentView.antialiasingMode = SCNAntialiasingModeMultisampling4X;
+        _agentView.backgroundColor = aimRGB(30, 24, 36);
+        SCNScene *scene = [SCNScene scene];
+        _agentRoot = buildAgentModel();
+        _agentRoot.eulerAngles = SCNVector3Make(0, -0.55, 0);
+        [scene.rootNode addChildNode:_agentRoot];
+        SCNNode *cam = [SCNNode node]; cam.camera = [SCNCamera camera]; cam.camera.fieldOfView = 32;
+        cam.position = SCNVector3Make(0, 0.98, 3.35); [scene.rootNode addChildNode:cam];
+        SCNNode *amb = [SCNNode node]; amb.light = [SCNLight light]; amb.light.type = SCNLightTypeAmbient;
+        amb.light.color = [UIColor colorWithWhite:0.42 alpha:1]; [scene.rootNode addChildNode:amb];
+        SCNNode *key = [SCNNode node]; key.light = [SCNLight light]; key.light.type = SCNLightTypeDirectional;
+        key.light.color = [UIColor colorWithWhite:0.95 alpha:1]; key.eulerAngles = SCNVector3Make(-0.5, 0.6, 0); [scene.rootNode addChildNode:key];
+        SCNNode *rim = [SCNNode node]; rim.light = [SCNLight light]; rim.light.type = SCNLightTypeDirectional;
+        rim.light.color = aimRGB(180, 60, 60); rim.eulerAngles = SCNVector3Make(-0.2, -2.4, 0); [scene.rootNode addChildNode:rim];
+        _agentView.scene = scene; _agentView.pointOfView = cam;
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(agentTapped:)];
+        [_agentView addGestureRecognizer:tap];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(agentPanned:)];
+        [_agentView addGestureRecognizer:pan];
+        [preview.v addSubview:_agentView];
+        for (int dir = -1; dir <= 1; dir += 2) {
+            UIButton *r = [UIButton buttonWithType:UIButtonTypeCustom];
+            r.frame = CGRectMake(dir < 0 ? 6 : VW - 32, VH - 30, 26, 24); r.tag = dir;
+            r.backgroundColor = [NL_SIDE colorWithAlphaComponent:0.7]; r.layer.cornerRadius = 6;
+            r.layer.borderWidth = 1; r.layer.borderColor = NL_BORDER.CGColor;
+            [r setTitle:(dir < 0 ? @"\u2039" : @"\u203A") forState:UIControlStateNormal];
+            [r setTitleColor:NL_ACCENT forState:UIControlStateNormal];
+            r.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+            [r addTarget:self action:@selector(agentRotateTapped:) forControlEvents:UIControlEventTouchUpInside];
+            [_agentView addSubview:r];
         }
-        _aimPartInfo = [[UILabel alloc] initWithFrame:CGRectMake(12, 225, PW - 24, 16)];
+        _aimPartButtons = [NSMutableArray array];
+        _aimChipButtons = [NSMutableArray array];
+        const int order[kAimPartCount] = { kAimHead, kAimNeck, kAimChest, kAimStomach, kAimPelvis, kAimArm, kAimLeg, kAimFoot };
+        const CGFloat chipX = VX + VW + 12, chipW = PW - chipX - 10, chipH = 25, chipGap = 6;
+        for (int i = 0; i < kAimPartCount; i++) {
+            UIButton *chip = [UIButton buttonWithType:UIButtonTypeCustom];
+            chip.frame = CGRectMake(chipX, VY + i * (chipH + chipGap), chipW, chipH);
+            chip.tag = order[i]; chip.layer.cornerRadius = 6; chip.layer.borderWidth = 1;
+            chip.titleLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightSemibold];
+            [chip setTitle:aimPartTitle(order[i]).uppercaseString forState:UIControlStateNormal];
+            [chip addTarget:self action:@selector(aimPartTapped:) forControlEvents:UIControlEventTouchUpInside];
+            [preview.v addSubview:chip]; [_aimChipButtons addObject:chip];
+        }
+        _aimPartInfo = [[UILabel alloc] initWithFrame:CGRectMake(12, VY + VH + 8, PW - 24, 14)];
         _aimPartInfo.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightSemibold];
         _aimPartInfo.textColor = NL_ACCENT;
         [preview.v addSubview:_aimPartInfo];
-        preview.y = 246; nlEnd(preview);
+        preview.y = VY + VH + 30; nlEnd(preview);
         [self refreshAimPartPreview];
         pg.contentSize = CGSizeMake(PW, nlMaxY(preview.v.frame) + 8);
     }
@@ -1790,13 +1813,42 @@ static void nlSwatches(NLCard &k, int sel, id tgt, SEL act, NSMutableArray *out)
 }
 - (void)tabTapped:(UIButton *)b { [self selectTab:b.tag]; }
 - (void)refreshAimPartPreview {
-    for (UIButton *zone in _aimPartButtons) {
-        BOOL selected = zone.tag == g_selectedAimPart;
-        zone.backgroundColor = selected ? [NL_ACCENT colorWithAlphaComponent:0.34] : [NL_SIDE colorWithAlphaComponent:0.72];
-        zone.layer.borderColor = (selected ? NL_ACCENT : NL_BORDER).CGColor;
-        zone.layer.borderWidth = selected ? 2 : 1;
+    // 3D: selected region glows, everything else is plain
+    [_agentRoot enumerateHierarchyUsingBlock:^(SCNNode *n, BOOL *stop) {
+        if (![n.name hasPrefix:@"aim_"] || !n.geometry) return;
+        BOOL sel = [[n.name substringFromIndex:4] intValue] == g_selectedAimPart;
+        n.geometry.firstMaterial.emission.contents = sel ? [NL_ACCENT colorWithAlphaComponent:1] : UIColor.blackColor;
+        n.geometry.firstMaterial.emission.intensity = sel ? 0.75 : 0;
+    }];
+    for (UIButton *chip in _aimChipButtons) {
+        BOOL selected = chip.tag == g_selectedAimPart;
+        chip.backgroundColor = selected ? [NL_ACCENT colorWithAlphaComponent:0.22] : [NL_SIDE colorWithAlphaComponent:0.72];
+        chip.layer.borderColor = (selected ? NL_ACCENT : NL_BORDER).CGColor;
+        [chip setTitleColor:(selected ? NL_ACCENT : NL_TEXT) forState:UIControlStateNormal];
     }
-    _aimPartInfo.text = [NSString stringWithFormat:@"AIM TARGET: %@   •   TAP A BODY PART", aimPartTitle(g_selectedAimPart).uppercaseString];
+    _aimPartInfo.text = [NSString stringWithFormat:@"AIM TARGET: %@   \u2022   TAP A BODY PART", aimPartTitle(g_selectedAimPart).uppercaseString];
+}
+- (void)agentTapped:(UITapGestureRecognizer *)g {
+    NSArray<SCNHitTestResult *> *hits = [_agentView hitTest:[g locationInView:_agentView] options:@{ SCNHitTestBackFaceCullingKey: @YES }];
+    for (SCNHitTestResult *h in hits) {
+        for (SCNNode *n = h.node; n; n = n.parentNode) {
+            if (![n.name hasPrefix:@"aim_"]) continue;
+            int part = [[n.name substringFromIndex:4] intValue];
+            if (part < 0 || part >= kAimPartCount) return;
+            g_selectedAimPart = part; saveSettings(); [self refreshAimPartPreview];
+            return;
+        }
+    }
+}
+- (void)agentPanned:(UIPanGestureRecognizer *)g {
+    CGPoint t = [g translationInView:_agentView];
+    SCNVector3 e = _agentRoot.eulerAngles; e.y += t.x * 0.014f; _agentRoot.eulerAngles = e;
+    [g setTranslation:CGPointZero inView:_agentView];
+}
+- (void)agentRotateTapped:(UIButton *)b {
+    [SCNTransaction begin]; [SCNTransaction setAnimationDuration:0.25];
+    SCNVector3 e = _agentRoot.eulerAngles; e.y += (float)b.tag * 0.6f; _agentRoot.eulerAngles = e;
+    [SCNTransaction commit];
 }
 - (void)aimPartTapped:(UIButton *)b {
     if (b.tag < 0 || b.tag >= kAimPartCount) return;
