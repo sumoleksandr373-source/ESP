@@ -11,6 +11,8 @@
 // - health bar = vertical bar left of the box. The health field is obfuscated, so it is LEARNED:
 //   panel "Learn health" -> hit one bot once -> tap again. The field that dropped on exactly one
 //   character (and stayed put on all others) is stored and read every tick.
+// - armor bar = blue vertical bar right of the box, from PlayerController.odf() (armor int); the gold dot above it is the
+//   odg() armor flag (v24 reverse notes: HUD reads ode/odf/odg together). Meaning of odg() is by data flow, not proven.
 // - hot path uses direct method-pointer calls; drawing is 30 fps, scan about once a second
 //
 // Not compiled or run on a device by me. If something misbehaves, the panel's status line says where.
@@ -78,6 +80,7 @@ struct Settings {
     bool drawFov = true;    // draw the aim capture outline on screen
     bool dmg = true;        // floating damage numbers
     bool dmgMine = true;    // damage numbers only for hits taken while the target is under my crosshair
+    bool armor = true;      // armor bar (right of the box) + armor-flag marker, from PlayerController.odf()/odg()
 };
 static Settings g_set;
 static bool g_dirty = true;
@@ -109,6 +112,7 @@ static void saveSettings() {
     [d setBool:g_set.drawFov forKey:@"scesp_dfov"];
     [d setBool:g_set.dmg forKey:@"scesp_dmgnum"];
     [d setBool:g_set.dmgMine forKey:@"scesp_dmgmine"];
+    [d setBool:g_set.armor forKey:@"scesp_armor"];
     [d setInteger:g_selectedAimPart forKey:@"scesp_aim_part"];
 }
 static void loadSettings() {
@@ -130,6 +134,7 @@ static void loadSettings() {
     g_set.drawFov = [d objectForKey:@"scesp_dfov"] ? [d boolForKey:@"scesp_dfov"] : true;
     g_set.dmg = [d objectForKey:@"scesp_dmgnum"] ? [d boolForKey:@"scesp_dmgnum"] : true;
     g_set.dmgMine = [d objectForKey:@"scesp_dmgmine"] ? [d boolForKey:@"scesp_dmgmine"] : true;
+    g_set.armor = [d objectForKey:@"scesp_armor"] ? [d boolForKey:@"scesp_armor"] : true;
     g_selectedAimPart = (int)[d integerForKey:@"scesp_aim_part"];
     if (g_selectedAimPart < 0 || g_selectedAimPart >= kAimPartCount) g_selectedAimPart = kAimHead;
 }
@@ -308,6 +313,7 @@ static void *k_targets[8];
 static const int kOffBot = 0xC8;      // PlayerController.<cfip> : BotPlayerController  (non-null = bot)
 static const int kOffAim = 0xD0;      // PlayerController.<cfiq> : AimController         (back-reference at AimController +0xC8)
 static void *mi_hp;                   // PlayerController.ode() -> int  current HP
+static void *mi_armor, *mi_helm;      // PlayerController.odf() -> int armor value, odg() -> bool armor flag (v24 notes: HUD reads both next to HP)
 static int g_nBots = 0;
 static size_t g_counts[8];
 static int g_active = -1;
@@ -417,7 +423,8 @@ static bool resolveAll() {
     for (int i = 0; i < kN; i++) k_targets[i] = il2_class_from_name(game, kTargets[i].ns, kTargets[i].name);
     { void *kpc = il2_class_from_name(game, "Chillow.StandChillow.Player", "PlayerController");
       if (kpc) mi_hp = il2_get_method(kpc, "ode", 0);
-      NSLog(@"[SCESP] PlayerController.ode() = %p", mi_hp); }
+      if (kpc) { mi_armor = il2_get_method(kpc, "odf", 0); mi_helm = il2_get_method(kpc, "odg", 0); }
+      NSLog(@"[SCESP] PlayerController.ode() = %p odf() = %p odg() = %p", mi_hp, mi_armor, mi_helm); }
     k_aim = il2_class_from_name(game, "Chillow.StandChillow.Player.Aim", "AimController");
     for (int r = 1; r < kHpRoots; r++) k_hpRoot[r] = il2_class_from_name(game, kHpRootDefs[r].ns, kHpRootDefs[r].name);
     if (il2_resolve_icall) {
@@ -1003,6 +1010,19 @@ static bool readHp(void *obj, PlayerInfo *pi, float &out) {
     if (g_haveHp) return readCand(g_hpC, obj, pi, out);
     return false;
 }
+// Armor from the game's own HUD getters (same keyed-container path as ode(), see v24 notes):
+// odf() -> Int32 armor value (0 when the lookup fails), odg() -> Boolean armor state used by the HUD armor icon.
+static bool readArmor(void *obj, int &armor, bool &flag) {
+    armor = 0; flag = false;
+    if (!obj || !mi_armor) return false;
+    void *b = inv(mi_armor, obj, nullptr);
+    if (!b) return false;
+    int v = *(int *)((char *)b + 16);
+    if (v < 0 || v > 100000) return false;
+    armor = v;
+    if (mi_helm) { void *h = inv(mi_helm, obj, nullptr); if (h) flag = *(bool *)((char *)h + 16); }
+    return true;
+}
 static NSString *hpName(const HCand &c) {
     static const char *kn[] = { "float", "int", "obsF", "obsI" };
     return [NSString stringWithFormat:@"r%d %s %s%s%s nd=%d off=%d/%d/%d", c.root, kn[c.kind & 3], c.n1 ? c.n1 : "", c.n1 ? "." : "", c.n2 ? c.n2 : "?", c.nd, c.off[0], c.off[1], c.off[2]];
@@ -1585,7 +1605,7 @@ static SCNNode *buildAgentModel() {
 @implementation SCESPDriver {
     UIView *_overlay;
     CAShapeLayer *_boxes, *_skel;
-    CAShapeLayer *_hpBack, *_hpG, *_hpY, *_hpR, *_hdot;
+    CAShapeLayer *_hpBack, *_hpG, *_hpY, *_hpR, *_hdot, *_arm, *_armFlag;
     UIButton *_btn, *_hpBtn;
     UIView *_panel;
     UILabel *_status;
@@ -1777,6 +1797,7 @@ static SCNNode *buildAgentModel() {
         nlToggle(a, @"Chams", 3, g_set.chams, self, @selector(swChanged:));
         nlToggle(a, @"Head dot", 12, g_set.hdot, self, @selector(swChanged:));
         nlToggle(a, @"Health bar", 9, g_set.hp, self, @selector(swChanged:));
+        nlToggle(a, @"Armor bar", 18, g_set.armor, self, @selector(swChanged:));
         nlToggle(a, @"Damage numbers", 16, g_set.dmg, self, @selector(swChanged:));
         nlToggle(a, @"My damage only", 17, g_set.dmgMine, self, @selector(swChanged:));
         nlToggle(a, @"Teammates", 5, g_set.team, self, @selector(swChanged:));
@@ -1908,6 +1929,7 @@ static SCNNode *buildAgentModel() {
         case 15: g_set.drawFov = s.on; break;
         case 16: g_set.dmg = s.on; if (!s.on) g_pops.clear(); break;
         case 17: g_set.dmgMine = s.on; break;
+        case 18: g_set.armor = s.on; break;
     }
     g_dirty = true; saveSettings();
 }
@@ -1988,6 +2010,12 @@ static SCNNode *buildAgentModel() {
         _hpR.fillColor = [UIColor colorWithRed:1 green:0.15 blue:0.15 alpha:1].CGColor;
         [_overlay.layer addSublayer:_boxes]; [_overlay.layer addSublayer:_skel];
         for (CAShapeLayer *hl in @[_hpBack, _hpG, _hpY, _hpR]) { hl.strokeColor = nil; [_overlay.layer addSublayer:hl]; }
+        _arm = [CAShapeLayer layer]; _armFlag = [CAShapeLayer layer];
+        _arm.fillColor = [UIColor colorWithRed:0.25 green:0.62 blue:1 alpha:1].CGColor;
+        _armFlag.fillColor = [UIColor colorWithRed:1 green:0.82 blue:0.2 alpha:1].CGColor;
+        _armFlag.strokeColor = [UIColor colorWithWhite:0 alpha:0.85].CGColor; _armFlag.lineWidth = 1;
+        _arm.strokeColor = nil;
+        [_overlay.layer addSublayer:_arm]; [_overlay.layer addSublayer:_armFlag];
         _hdot = [CAShapeLayer layer];
         _hdot.strokeColor = [UIColor colorWithWhite:0 alpha:0.85].CGColor; _hdot.lineWidth = 1;
         [_overlay.layer addSublayer:_hdot];
@@ -2001,6 +2029,8 @@ static SCNNode *buildAgentModel() {
     UIBezierPath *skelPath = [UIBezierPath bezierPath];
     UIBezierPath *hpBack = [UIBezierPath bezierPath], *hpG = [UIBezierPath bezierPath], *hpY = [UIBezierPath bezierPath], *hpR = [UIBezierPath bezierPath];
     bool wantHp = g_set.hp && (mi_hp || g_haveHp);
+    bool wantArmor = g_set.armor && mi_armor;
+    UIBezierPath *armPath = [UIBezierPath bezierPath], *armFlagPath = [UIBezierPath bezierPath];
     UIBezierPath *dotPath = [UIBezierPath bezierPath];
     UIBezierPath *fovPath = [UIBezierPath bezierPath];
     std::vector<DmgDraw> dd;
@@ -2151,7 +2181,7 @@ static SCNNode *buildAgentModel() {
                             [skelPath moveToPoint:sp[par]]; [skelPath addLineToPoint:sp[b]];
                         }
                     }
-                    if (g_set.box || g_set.fill || wantHp) {
+                    if (g_set.box || g_set.fill || wantHp || wantArmor) {
                         CGRect r;
                         if (haveBones) {
                             CGFloat pad = 6;
@@ -2179,6 +2209,23 @@ static SCNNode *buildAgentModel() {
                             CGFloat fh = r.size.height * ratio;
                             UIBezierPath *tgt = ratio > 0.6 ? hpG : (ratio > 0.3 ? hpY : hpR);
                             [tgt appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(bx, r.origin.y + r.size.height - fh, bw, fh)]];
+                        }
+                        // armor bar: right side of the box, blue; the gold dot above it = odg() armor flag
+                        if (wantArmor && !(hpOk && hpv <= 0.f)) {
+                            int av = 0; bool flag = false;
+                            if (readArmor(p.obj, av, flag) && (av > 0 || flag)) {
+                                CGFloat bw = fmax(3.0, g_set.lw * 2), ax = r.origin.x + r.size.width + 3;
+                                if (av > 0) {
+                                    CGFloat ratio = fminf(1.f, (float)av / 100.f);
+                                    [hpBack appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(ax - 1, r.origin.y - 1, bw + 2, r.size.height + 2)]];
+                                    CGFloat fh = r.size.height * ratio;
+                                    [armPath appendPath:[UIBezierPath bezierPathWithRect:CGRectMake(ax, r.origin.y + r.size.height - fh, bw, fh)]];
+                                }
+                                if (flag) {
+                                    CGFloat d = bw + 4;
+                                    [armFlagPath appendPath:[UIBezierPath bezierPathWithOvalInRect:CGRectMake(ax - 2, r.origin.y - d - 3, d, d)]];
+                                }
+                            }
                         }
                     }
                     drawn++;
@@ -2299,6 +2346,8 @@ static SCNNode *buildAgentModel() {
     _fovRing.strokeColor = ((g_set.aim && g_lockId) ? nlRGB(70, 255, 120, 0.95) : nlRGB(61, 166, 255, 0.75)).CGColor;
     _hdot.frame = _overlay.bounds; _hdot.path = dotPath.CGPath; _hdot.fillColor = colorFor(g_set.color, 1).CGColor;
     _hpBack.path = hpBack.CGPath; _hpG.path = hpG.CGPath; _hpY.path = hpY.CGPath; _hpR.path = hpR.CGPath;
+    _arm.frame = _overlay.bounds; _armFlag.frame = _overlay.bounds;
+    _arm.path = armPath.CGPath; _armFlag.path = armFlagPath.CGPath;
     if (!_dmgLabels) _dmgLabels = [NSMutableArray array];
     while (_dmgLabels.count < 10) {
         UILabel *dl = [[UILabel alloc] init];
@@ -2331,7 +2380,7 @@ static SCNNode *buildAgentModel() {
             NSString *l3 = (g_learn || now < g_msgUntil) ? g_learnMsg
                          : (g_set.aim ? ((g_haveYaw && g_havePit) ? [NSString stringWithFormat:@"aim: ON, bots %d%@", g_nBots, g_nBots ? @"" : @" (none: no lock)"] : @"aim: ON but NOT learned -> Learn look fields")
                                       : diagRenderer(diagR));
-            _status.text = [_status.text stringByAppendingFormat:@"\n%@\n%@", l3, mi_hp ? @"hp: PlayerController.ode()" : g_hpMsg];
+            _status.text = [_status.text stringByAppendingFormat:@"\n%@\n%@", l3, mi_hp ? (mi_armor ? @"hp: ode() | armor: odf()/odg()" : @"hp: PlayerController.ode() | armor: n/a") : g_hpMsg];
             _aimInfo.text = l3;
         } @catch (...) {}
     }
